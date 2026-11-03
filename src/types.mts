@@ -21,6 +21,19 @@ export interface OpenOptions {
 	readonly password?: string;
 }
 
+export type ArchiveFormat = '7z' | 'zip' | 'tar' | 'wim';
+
+export interface ArchiveCreateEntry {
+	readonly sourcePath: string;
+	readonly path: string;
+}
+
+export interface CreateArchiveOptions {
+	readonly format?: ArchiveFormat;
+	readonly compressionLevel?: number;
+	readonly overwrite?: boolean;
+}
+
 export interface ExtractToFolderProgress {
 	readonly filesExtracted: number;
 	readonly totalFiles: number;
@@ -52,7 +65,8 @@ export type ArchiveErrorCode
 		| 'ERR_ARCHIVE_OPEN'
 		| 'ERR_ARCHIVE_PASSWORD'
 		| 'ERR_ARCHIVE_PATH'
-		| 'ERR_ARCHIVE_EXTRACT';
+		| 'ERR_ARCHIVE_EXTRACT'
+		| 'ERR_ARCHIVE_CREATE';
 
 export class ArchiveError extends Error {
 	constructor(readonly code: ArchiveErrorCode, message: string, options?: ErrorOptions) {

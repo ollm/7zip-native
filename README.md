@@ -139,6 +139,20 @@ await archive.extractToStream(entry.path, createWriteStream('./page.jpg'), {
 
 This respects backpressure and ends the destination when extraction succeeds. A destination error, early close, or abort rejects the Promise.
 
+### Creating ZIP, 7z, TAR, and WIM archives
+
+```ts
+await Archive.create('./comic.cbz', [
+	{sourcePath: './pages/cover.jpg', path: 'cover.jpg'},
+	{sourcePath: './pages/01.jpg', path: 'pages/01.jpg'},
+], {
+	compressionLevel: 5,
+	overwrite: false,
+});
+```
+
+`Archive.create()` accepts regular source files and their desired archive-internal paths. It infers ZIP from `.zip` or `.cbz`, 7z from `.7z`, TAR from `.tar`, and WIM from `.wim`; set `format: 'zip'`, `'7z'`, `'tar'`, or `'wim'` to use another output extension. Compression level is an integer from 0 to 9, defaults to 5, and applies only to ZIP and 7z. TAR is uncompressed; WIM uses the upstream handler's default settings. Duplicate, unsafe, or conflicting internal paths are rejected. The output is first written to a temporary file beside the destination, then installed atomically; an existing file is preserved unless `overwrite: true` is specified. Archive creation runs in the bounded native worker pool and does not launch a 7-Zip executable.
+
 ### Extracting to a folder
 
 ```ts
@@ -189,6 +203,7 @@ Invalid argument types and values throw standard `TypeError` or `RangeError`. Ar
 | `ERR_ARCHIVE_PASSWORD` | Password is missing or incorrect when requested by the handler |
 | `ERR_ARCHIVE_PATH` | Unsafe or colliding path during folder extraction |
 | `ERR_ARCHIVE_EXTRACT` | Entry extraction failed |
+| `ERR_ARCHIVE_CREATE` | Archive creation failed or the output already exists |
 
 Buffered `extract()` and `read()` do not currently support cancellation. Streams and folder extraction accept an `AbortSignal`.
 
@@ -199,6 +214,7 @@ The package uses the handlers registered in the pinned upstream `Format7zF` bund
 ### Format-specific notes
 
 - **RAR:** extraction uses upstream code subject to its LGPL terms and the unRAR restriction. This package does not create RAR archives or implement the proprietary RAR compression algorithm. Review the upstream notices before redistribution.
+- **Creation:** ZIP, 7z, TAR, and WIM archives can be created from filesystem files. Streams and directory trees are not accepted as sources.
 - **ACE:** not supported by this 7-Zip revision.
 - **Encryption:** password callbacks are connected to archive opening and extraction. AES-256 encrypted ZIP extraction and range reads are tested on Linux x64; encrypted-header behavior and password variants in other formats are not yet verified.
 - **Partial reads:** memory use is limited to the requested range, but the decoder may still process more data internally, especially for solid or sequential formats.

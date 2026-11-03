@@ -120,6 +120,71 @@ after(async () => {
 	await rm(directory, {recursive: true, force: true});
 });
 
+for(const format of ['zip', '7z', 'tar', 'wim'] as const)
+{
+	test(`creates and verifies a native ${format} archive from sample images`, async () => {
+		const outputPath = join(directory, `created.${format}`);
+		const sourceEntries = sampleAssetPaths.map(path => ({
+			sourcePath: join(sampleDirectory, path),
+			path,
+		}));
+		await Archive.create(outputPath, sourceEntries);
+		const archive = await Archive.open(outputPath);
+		try
+		{
+			const entries = await archive.entries();
+			const files = entries.filter(entry => !entry.isDirectory);
+			assert.deepEqual(files.map(entry => entry.path).sort(), sampleAssetPaths);
+			for(const entry of files)
+			{
+				assert.deepEqual(
+					await archive.extract(entry.id),
+					await readFile(join(sampleDirectory, entry.path)),
+					`${format}: ${entry.path}`,
+				);
+			}
+		}
+		finally
+		{
+			await archive.close();
+		}
+	});
+}
+
+test('creates archives atomically, enforces overwrite, and validates entry paths', async () => {
+	const outputPath = join(directory, 'created-overwrite.zip');
+	const [path] = sampleAssetPaths;
+	assert.ok(path);
+	const entry = {sourcePath: join(sampleDirectory, path), path};
+	await Archive.create(outputPath, [entry]);
+	await assert.rejects(Archive.create(outputPath, [entry]), {
+		code: 'ERR_ARCHIVE_CREATE',
+	});
+	await Archive.create(outputPath, [entry], {overwrite: true, compressionLevel: 1});
+	await assert.rejects(
+		Archive.create(join(directory, 'unsafe.zip'), [{
+			sourcePath: entry.sourcePath,
+			path: '../outside.png',
+		}]),
+		(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_ARCHIVE_PATH',
+	);
+	await assert.rejects(
+		Archive.create(join(directory, 'duplicate.zip'), [entry, entry]),
+		(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_ARCHIVE_PATH',
+	);
+	await assert.rejects(
+		Archive.create(join(directory, 'missing-source.zip'), [{
+			sourcePath: join(directory, 'missing-source'),
+			path: 'missing-source',
+		}]),
+		(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_ARCHIVE_CREATE',
+	);
+	await assert.rejects(
+		Archive.create(join(directory, 'compressed.tar'), [entry], {compressionLevel: 1}),
+		TypeError,
+	);
+});
+
 test('opens, indexes, partially reads, and extracts ZIP entries', async () => {
 	const archive = await Archive.open(archivePath);
 	try

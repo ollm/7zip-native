@@ -486,6 +486,11 @@ struct Entry {
 	bool encrypted = false;
 };
 
+struct ArchiveCreateItem {
+	std::string sourcePath;
+	std::string path;
+};
+
 std::uint64_t GetPropUInt64(IInArchive *archive, std::uint32_t index, PROPID propId)
 {
 	NWindows::NCOM::CPropVariant value;
@@ -631,6 +636,152 @@ Z7_COM7F_IMF(FileInStream::Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosi
 	return S_OK;
 }
 
+class CreateFileInStream final : public ISequentialInStream, public CMyUnknownImp {
+	Z7_COM_UNKNOWN_IMP_1(ISequentialInStream)
+	Z7_COM7F_IMP(Read(void *data, UInt32 size, UInt32 *processedSize))
+
+public:
+	bool Open(const std::string& path)
+	{
+		file_.open(NativePath(path), std::ios::binary);
+		return file_.is_open();
+	}
+
+private:
+	std::ifstream file_;
+};
+
+Z7_COM7F_IMF(CreateFileInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
+{
+	file_.read(static_cast<char *>(data), static_cast<std::streamsize>(size));
+	const auto count = file_.gcount();
+	if (processedSize != nullptr) {
+		*processedSize = static_cast<UInt32>(count);
+	}
+	return file_.bad() ? E_FAIL : S_OK;
+}
+
+class CreateFileOutStream final : public IOutStream, public CMyUnknownImp {
+	Z7_COM_QI_BEGIN2(IOutStream)
+	Z7_COM_QI_ENTRY(ISequentialOutStream)
+	Z7_COM_QI_END
+	Z7_COM_ADDREF_RELEASE
+
+	Z7_COM7F_IMP(Write(const void *data, UInt32 size, UInt32 *processedSize))
+	Z7_IFACE_COM7_IMP(IOutStream)
+
+public:
+	bool Open(const std::string& path)
+	{
+		path_ = NativePath(path);
+		file_.open(path_, std::ios::binary | std::ios::trunc);
+		return file_.is_open();
+	}
+
+	bool Close()
+	{
+		file_.flush();
+		const bool success = file_.good();
+		file_.close();
+		return success && !file_.fail();
+	}
+
+private:
+	std::filesystem::path path_;
+	std::ofstream file_;
+};
+
+Z7_COM7F_IMF(CreateFileOutStream::Write(
+	const void *data, UInt32 size, UInt32 *processedSize))
+{
+	file_.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+	if (!file_.good()) {
+		return E_FAIL;
+	}
+	if (processedSize != nullptr) {
+		*processedSize = size;
+	}
+	return S_OK;
+}
+
+Z7_COM7F_IMF(CreateFileOutStream::Seek(
+	Int64 offset, UInt32 seekOrigin, UInt64 *newPosition))
+{
+	UInt64 base = 0;
+	if (seekOrigin == 1) {
+		const auto current = file_.tellp();
+		if (current < 0) {
+			return E_FAIL;
+		}
+		base = static_cast<UInt64>(current);
+	} else if (seekOrigin == 2) {
+		file_.flush();
+		if (!file_.good()) {
+			return E_FAIL;
+		}
+		std::error_code error;
+		const auto size = std::filesystem::file_size(path_, error);
+		if (error) {
+			return E_FAIL;
+		}
+		base = size;
+	} else if (seekOrigin != 0) {
+		return E_INVALIDARG;
+	}
+	if (base > static_cast<UInt64>(INT64_MAX)) {
+		return E_INVALIDARG;
+	}
+
+	UInt64 target = 0;
+	if (offset >= 0) {
+		const auto advance = static_cast<UInt64>(offset);
+		if (advance > static_cast<UInt64>(INT64_MAX) - base) {
+			return E_INVALIDARG;
+		}
+		target = base + advance;
+	} else {
+		const auto retreat = static_cast<UInt64>(-(offset + 1)) + 1;
+		if (retreat > base) {
+			return E_INVALIDARG;
+		}
+		target = base - retreat;
+	}
+	file_.clear();
+	file_.seekp(static_cast<std::streamoff>(target), std::ios::beg);
+	if (!file_.good()) {
+		return E_FAIL;
+	}
+	if (newPosition != nullptr) {
+		*newPosition = target;
+	}
+	return S_OK;
+}
+
+Z7_COM7F_IMF(CreateFileOutStream::SetSize(UInt64 newSize))
+{
+	if (newSize > static_cast<UInt64>(INT64_MAX)) {
+		return E_INVALIDARG;
+	}
+	file_.flush();
+	if (!file_.good()) {
+		return E_FAIL;
+	}
+	const auto current = file_.tellp();
+	std::error_code error;
+	std::filesystem::resize_file(path_, newSize, error);
+	if (error) {
+		return E_FAIL;
+	}
+	if (current >= 0 && static_cast<UInt64>(current) > newSize) {
+		file_.clear();
+		file_.seekp(static_cast<std::streamoff>(newSize), std::ios::beg);
+		if (!file_.good()) {
+			return E_FAIL;
+		}
+	}
+	return S_OK;
+}
+
 class ArchiveOpenCallback final :
 	public IArchiveOpenCallback,
 	public ICryptoGetTextPassword,
@@ -671,6 +822,193 @@ Z7_COM7F_IMF(ArchiveOpenCallback::CryptoGetTextPassword(BSTR *password))
 {
 	passwordRequested_.store(true, std::memory_order_release);
 	return GetPasswordBstr(password_, password);
+}
+
+class ArchiveUpdateCallback final :
+	public IArchiveUpdateCallback,
+	public CMyUnknownImp {
+	Z7_COM_QI_BEGIN2(IArchiveUpdateCallback)
+	Z7_COM_QI_ENTRY(IProgress)
+	Z7_COM_QI_END
+	Z7_COM_ADDREF_RELEASE
+
+	Z7_IFACE_COM7_IMP(IProgress)
+	Z7_IFACE_COM7_IMP(IArchiveUpdateCallback)
+
+public:
+	explicit ArchiveUpdateCallback(const std::vector<ArchiveCreateItem>& items)
+		: items_(items), operationResult_(NArchive::NUpdate::NOperationResult::kOK) {}
+
+	Int32 OperationResult() const
+	{
+		return operationResult_;
+	}
+
+private:
+	const std::vector<ArchiveCreateItem>& items_;
+	Int32 operationResult_;
+};
+
+Z7_COM7F_IMF(ArchiveUpdateCallback::SetTotal(UInt64))
+{
+	return S_OK;
+}
+
+Z7_COM7F_IMF(ArchiveUpdateCallback::SetCompleted(const UInt64 *))
+{
+	return S_OK;
+}
+
+Z7_COM7F_IMF(ArchiveUpdateCallback::GetUpdateItemInfo(
+	UInt32 index, Int32 *newData, Int32 *newProperties, UInt32 *indexInArchive))
+{
+	if (index >= items_.size()) {
+		return E_INVALIDARG;
+	}
+	if (newData != nullptr) {
+		*newData = 1;
+	}
+	if (newProperties != nullptr) {
+		*newProperties = 1;
+	}
+	if (indexInArchive != nullptr) {
+		*indexInArchive = static_cast<UInt32>(-1);
+	}
+	return S_OK;
+}
+
+Z7_COM7F_IMF(ArchiveUpdateCallback::GetProperty(
+	UInt32 index, PROPID propertyId, PROPVARIANT *value))
+{
+	if (value == nullptr || index >= items_.size()) {
+		return E_INVALIDARG;
+	}
+	NWindows::NCOM::CPropVariant property;
+	try {
+		const auto& item = items_[index];
+		if (propertyId == kpidPath) {
+			const auto path = FromUtf8(item.path);
+			property = path.c_str();
+		} else if (propertyId == kpidIsDir) {
+			property = false;
+		} else if (propertyId == kpidSize) {
+			std::error_code error;
+			const auto size = std::filesystem::file_size(NativePath(item.sourcePath), error);
+			if (error) {
+				return E_FAIL;
+			}
+			property = static_cast<UInt64>(size);
+		}
+	} catch (...) {
+		return E_INVALIDARG;
+	}
+	property.Detach(value);
+	return S_OK;
+}
+
+Z7_COM7F_IMF(ArchiveUpdateCallback::GetStream(
+	UInt32 index, ISequentialInStream **inStream))
+{
+	if (inStream == nullptr || index >= items_.size()) {
+		return E_INVALIDARG;
+	}
+	*inStream = nullptr;
+	auto *fileObject = new CreateFileInStream();
+	CMyComPtr<ISequentialInStream> file = fileObject;
+	if (!fileObject->Open(items_[index].sourcePath)) {
+		return E_FAIL;
+	}
+	*inStream = file;
+	(*inStream)->AddRef();
+	return S_OK;
+}
+
+Z7_COM7F_IMF(ArchiveUpdateCallback::SetOperationResult(Int32 operationResult))
+{
+	if (operationResult != NArchive::NUpdate::NOperationResult::kOK) {
+		operationResult_ = operationResult;
+	}
+	return S_OK;
+}
+
+GUID FindOutputArchiveClassId(const std::string& format)
+{
+	UInt32 count = 0;
+	if (g_getNumberOfFormats(&count) != S_OK) {
+		throw std::runtime_error("Unable to enumerate 7-Zip archive handlers");
+	}
+	for (UInt32 i = 0; i < count; ++i) {
+		NWindows::NCOM::CPropVariant name;
+		if (g_getHandlerProperty(i, NArchive::NHandlerPropID::kName, &name) != S_OK
+			|| name.vt != VT_BSTR || LowerAscii(ToUtf8(name.bstrVal)) != format) {
+			continue;
+		}
+		NWindows::NCOM::CPropVariant classIdValue;
+		if (g_getHandlerProperty(i, NArchive::NHandlerPropID::kClassID, &classIdValue) != S_OK
+			|| classIdValue.vt != VT_BSTR
+			|| ::SysStringByteLen(classIdValue.bstrVal) != sizeof(GUID)) {
+			continue;
+		}
+		GUID classId;
+		std::memcpy(&classId, classIdValue.bstrVal, sizeof(classId));
+		void *created = nullptr;
+		if (g_createObject(&classId, &IID_IOutArchive, &created) == S_OK && created != nullptr) {
+			static_cast<IOutArchive *>(created)->Release();
+			return classId;
+		}
+	}
+	throw std::runtime_error("The bundled 7-Zip engine has no output handler for format " + format);
+}
+
+void CreateArchiveWith7Zip(
+	const std::string& outputPath,
+	const std::string& format,
+	const std::vector<ArchiveCreateItem>& items,
+	std::uint32_t compressionLevel,
+	const std::string& enginePath)
+{
+	EnsureEngineLoaded(enginePath);
+	const auto classId = FindOutputArchiveClassId(format);
+	void *created = nullptr;
+	if (g_createObject(&classId, &IID_IOutArchive, &created) != S_OK || created == nullptr) {
+		throw std::runtime_error("Unable to create the 7-Zip output handler");
+	}
+	CMyComPtr<IOutArchive> archive;
+	archive.Attach(static_cast<IOutArchive *>(created));
+
+	if (format == "7z" || format == "zip") {
+		CMyComPtr<ISetProperties> properties;
+		if (archive.QueryInterface(IID_ISetProperties, &properties) != S_OK || !properties) {
+			throw std::runtime_error("The 7-Zip output handler does not support compression settings");
+		}
+		const wchar_t *propertyNames[] = {L"x"};
+		NWindows::NCOM::CPropVariant propertyValues[1];
+		propertyValues[0] = static_cast<UInt32>(compressionLevel);
+		if (properties->SetProperties(propertyNames, propertyValues, 1) != S_OK) {
+			throw std::runtime_error("The 7-Zip output handler rejected the compression level");
+		}
+	}
+
+	auto *outputObject = new CreateFileOutStream();
+	CMyComPtr<ISequentialOutStream> output = outputObject;
+	if (!outputObject->Open(outputPath)) {
+		throw std::runtime_error("Unable to open temporary archive output path");
+	}
+	auto *callbackObject = new ArchiveUpdateCallback(items);
+	CMyComPtr<IArchiveUpdateCallback> callback = callbackObject;
+	const auto result = archive->UpdateItems(
+		output,
+		static_cast<UInt32>(items.size()),
+		callback);
+	if (result != S_OK) {
+		throw std::runtime_error("The 7-Zip handler failed while creating the archive");
+	}
+	if (callbackObject->OperationResult() != NArchive::NUpdate::NOperationResult::kOK) {
+		throw std::runtime_error("The 7-Zip handler failed to read one or more source files");
+	}
+	if (!outputObject->Close()) {
+		throw std::runtime_error("Unable to finish writing the archive output");
+	}
 }
 
 class VectorOutStream final : public ISequentialOutStream, public CMyUnknownImp {
@@ -1620,6 +1958,62 @@ private:
 	std::string error_;
 };
 
+class CreateArchiveWorker final : public ExtractionTask {
+public:
+	CreateArchiveWorker(
+		Napi::Promise::Deferred deferred,
+		std::string outputPath,
+		std::string format,
+		std::vector<ArchiveCreateItem> items,
+		std::uint32_t compressionLevel,
+		std::string enginePath)
+		: deferred_(deferred),
+			outputPath_(std::move(outputPath)),
+			format_(std::move(format)),
+			items_(std::move(items)),
+			compressionLevel_(compressionLevel),
+			enginePath_(std::move(enginePath)) {}
+
+	~CreateArchiveWorker() override
+	{
+		g_pendingOperations.fetch_sub(1, std::memory_order_acq_rel);
+	}
+
+	void Execute() noexcept override
+	{
+		try {
+			CreateArchiveWith7Zip(
+				outputPath_,
+				format_,
+				items_,
+				compressionLevel_,
+				enginePath_);
+		} catch (const std::exception& error) {
+			error_ = error.what();
+		} catch (...) {
+			error_ = "Unknown native archive creation failure";
+		}
+	}
+
+	void Complete(Napi::Env env) override
+	{
+		if (!error_.empty()) {
+			deferred_.Reject(Napi::Error::New(env, error_).Value());
+			return;
+		}
+		deferred_.Resolve(env.Undefined());
+	}
+
+private:
+	Napi::Promise::Deferred deferred_;
+	std::string outputPath_;
+	std::string format_;
+	std::vector<ArchiveCreateItem> items_;
+	std::uint32_t compressionLevel_;
+	std::string enginePath_;
+	std::string error_;
+};
+
 class StreamWorker final : public ExtractionTask {
 public:
 	StreamWorker(
@@ -1872,6 +2266,81 @@ Napi::Value Open(const Napi::CallbackInfo& info)
 		std::move(password),
 		info[2].As<Napi::String>().Utf8Value());
 	worker->Queue();
+	return deferred.Promise();
+}
+
+Napi::Value CreateArchive(const Napi::CallbackInfo& info)
+{
+	const auto env = info.Env();
+	if (info.Length() != 5 || !info[0].IsString() || !info[1].IsString()
+		|| !info[2].IsArray() || !info[3].IsNumber() || !info[4].IsString()) {
+		throw Napi::TypeError::New(
+			env, "create(outputPath, format, entries, compressionLevel, enginePath) expects valid arguments");
+	}
+	const auto format = info[1].As<Napi::String>().Utf8Value();
+	if (format != "7z" && format != "zip" && format != "tar" && format != "wim") {
+		throw Napi::TypeError::New(env, "Archive format must be 7z, zip, tar, or wim");
+	}
+	const double levelValue = info[3].As<Napi::Number>().DoubleValue();
+	if (!std::isfinite(levelValue) || std::floor(levelValue) != levelValue
+		|| levelValue < 0 || levelValue > 9) {
+		throw Napi::RangeError::New(env, "Compression level must be an integer between 0 and 9");
+	}
+	const auto inputEntries = info[2].As<Napi::Array>();
+	if (inputEntries.Length() > kMaxEntries) {
+		throw Napi::RangeError::New(env, "Archive creation exceeds the native entry limit");
+	}
+	std::vector<ArchiveCreateItem> entries;
+	entries.reserve(inputEntries.Length());
+	for (std::uint32_t i = 0; i < inputEntries.Length(); ++i) {
+		const auto value = inputEntries.Get(i);
+		if (!value.IsObject() || value.IsNull()) {
+			throw Napi::TypeError::New(env, "Archive creation entries must be objects");
+		}
+		const auto item = value.As<Napi::Object>();
+		const auto sourcePath = item.Get("sourcePath");
+		const auto archivePath = item.Get("path");
+		if (!sourcePath.IsString() || !archivePath.IsString()) {
+			throw Napi::TypeError::New(
+				env, "Archive creation entries require string sourcePath and path values");
+		}
+		entries.push_back({
+			sourcePath.As<Napi::String>().Utf8Value(),
+			archivePath.As<Napi::String>().Utf8Value(),
+		});
+	}
+	if (!ReserveOperation()) {
+		throw Napi::Error::New(env, "Native operation queue is full");
+	}
+	auto deferred = Napi::Promise::Deferred::New(env);
+	CreateArchiveWorker *worker = nullptr;
+	try {
+		if (g_extractionPool == nullptr) {
+			throw std::runtime_error("Native extraction pool is not initialized");
+		}
+		worker = new CreateArchiveWorker(
+			deferred,
+			info[0].As<Napi::String>().Utf8Value(),
+			format,
+			std::move(entries),
+			static_cast<std::uint32_t>(levelValue),
+			info[4].As<Napi::String>().Utf8Value());
+		g_extractionPool->Queue(env, worker);
+	} catch (const std::exception& error) {
+		if (worker != nullptr) {
+			delete worker;
+		} else {
+			g_pendingOperations.fetch_sub(1, std::memory_order_acq_rel);
+		}
+		throw Napi::Error::New(env, error.what());
+	} catch (...) {
+		if (worker != nullptr) {
+			delete worker;
+		} else {
+			g_pendingOperations.fetch_sub(1, std::memory_order_acq_rel);
+		}
+		throw Napi::Error::New(env, "Unable to queue native archive creation");
+	}
 	return deferred.Promise();
 }
 
@@ -2138,6 +2607,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports)
 		throw;
 	}
 	exports.Set("open", Napi::Function::New(env, Open));
+	exports.Set("create", Napi::Function::New(env, CreateArchive));
 	exports.Set("entries", Napi::Function::New(env, Entries));
 	exports.Set("extract", Napi::Function::New(env, Extract));
 	exports.Set("startStream", Napi::Function::New(env, StartStream));

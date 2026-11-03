@@ -1,17 +1,20 @@
 import {createWriteStream, existsSync} from 'node:fs';
-import {lstat, mkdir, rename, rm} from 'node:fs/promises';
+import {link, lstat, mkdir, rename, rm} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 import {createRequire} from 'node:module';
 import {availableParallelism} from 'node:os';
-import {dirname, join, relative as relativePath, resolve, sep} from 'node:path';
+import {dirname, extname, join, relative as relativePath, resolve, sep} from 'node:path';
 import {Readable, Transform, type Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {
 	ArchiveError,
 	type ArchiveEntry,
+	type ArchiveCreateEntry,
+	type ArchiveFormat,
 	type EntryId,
 	type EntrySelector,
+	type CreateArchiveOptions,
 	type ExtractToFolderOptions,
 	type OpenOptions,
 	type ReadOptions,
@@ -21,7 +24,10 @@ import {
 export {ArchiveError} from './types.mjs';
 export type {
 	ArchiveEntry,
+	ArchiveCreateEntry,
+	ArchiveFormat,
 	ArchiveErrorCode,
+	CreateArchiveOptions,
 	EntryId,
 	EntrySelector,
 	ExtractToFolderProgress,
@@ -77,6 +83,13 @@ interface NativeBinding {
 	read(handle: bigint, id: number, offset: bigint, length: bigint): Promise<Buffer>;
 	concurrency(value?: number): number;
 	close(handle: bigint): void;
+	create(
+		outputPath: string,
+		format: ArchiveFormat,
+		entries: readonly ArchiveCreateEntry[],
+		compressionLevel: number,
+		enginePath: string,
+	): Promise<void>;
 }
 
 type NativeEntry = ArchiveEntry;
@@ -227,6 +240,55 @@ async function assertReplaceableOutput(filePath: string): Promise<void>
 			throw error;
 		}
 	}
+}
+
+async function assertOutputDoesNotExist(filePath: string): Promise<void>
+{
+	try
+	{
+		await lstat(filePath);
+		throw new ArchiveError('ERR_ARCHIVE_CREATE', `Output archive already exists: ${filePath}`);
+	}
+	catch (error)
+	{
+		if(error instanceof ArchiveError || (error as NodeJS.ErrnoException).code !== 'ENOENT')
+		{
+			throw error;
+		}
+	}
+}
+
+async function normalizeCreateEntry(entry: ArchiveCreateEntry): Promise<ArchiveCreateEntry>
+{
+	if(entry === null || typeof entry !== 'object'
+		|| typeof entry.sourcePath !== 'string' || entry.sourcePath.length === 0
+		|| typeof entry.path !== 'string' || entry.path.length === 0)
+	{
+		throw new TypeError('Each archive creation entry must have non-empty sourcePath and path strings');
+	}
+	const internalPath = safeEntrySegments(entry.path).join('/');
+	const sourcePath = resolve(entry.sourcePath);
+	let details: Awaited<ReturnType<typeof lstat>>;
+	try
+	{
+		details = await lstat(sourcePath);
+	}
+	catch (cause)
+	{
+		throw new ArchiveError(
+			'ERR_ARCHIVE_CREATE',
+			`Unable to access archive creation source: ${sourcePath}`,
+			{cause},
+		);
+	}
+	if(details.isSymbolicLink() || !details.isFile())
+	{
+		throw new ArchiveError(
+			'ERR_ARCHIVE_CREATE',
+			`Archive creation source is not a regular file: ${sourcePath}`,
+		);
+	}
+	return {sourcePath, path: internalPath};
 }
 
 async function ensureExtractionRoot(root: string): Promise<void>
@@ -441,6 +503,136 @@ export class Archive {
 				message,
 				{cause},
 			);
+		}
+	}
+
+	static async create(
+		outputPath: string,
+		entries: readonly ArchiveCreateEntry[],
+		options: CreateArchiveOptions = {},
+	): Promise<void> {
+		if(typeof outputPath !== 'string' || outputPath.length === 0)
+		{
+			throw new TypeError('Output archive path must be a non-empty string');
+		}
+		if(!Array.isArray(entries))
+		{
+			throw new TypeError('Archive creation entries must be an array');
+		}
+		if(entries.length > 1_000_000)
+		{
+			throw new RangeError('Archive creation exceeds the 1,000,000-entry limit');
+		}
+		if(options === null || typeof options !== 'object')
+		{
+			throw new TypeError('Archive creation options must be an object');
+		}
+		if(options.overwrite !== undefined && typeof options.overwrite !== 'boolean')
+		{
+			throw new TypeError('Archive creation overwrite option must be a boolean');
+		}
+		const compressionLevel = options.compressionLevel ?? 5;
+		if(!Number.isSafeInteger(compressionLevel) || compressionLevel < 0 || compressionLevel > 9)
+		{
+			throw new RangeError('Compression level must be an integer between 0 and 9');
+		}
+		const targetPath = resolve(outputPath);
+		let format: ArchiveFormat;
+		if(options.format !== undefined)
+		{
+			if(options.format !== '7z' && options.format !== 'zip'
+				&& options.format !== 'tar' && options.format !== 'wim')
+			{
+				throw new TypeError('Archive format must be "7z", "zip", "tar", or "wim"');
+			}
+			format = options.format;
+		}
+		else
+		{
+			const extension = extname(targetPath).toLowerCase();
+			if(extension === '.7z')
+			{
+				format = '7z';
+			}
+			else if(extension === '.zip' || extension === '.cbz')
+			{
+				format = 'zip';
+			}
+			else if(extension === '.tar')
+			{
+				format = 'tar';
+			}
+			else if(extension === '.wim')
+			{
+				format = 'wim';
+			}
+			else
+			{
+				throw new TypeError('Specify format as "7z", "zip", "tar", or "wim" for an unrecognized output extension');
+			}
+		}
+		if(options.compressionLevel !== undefined && format !== '7z' && format !== 'zip')
+		{
+			throw new TypeError('compressionLevel is only supported for ZIP and 7z archives');
+		}
+
+		const normalizedEntries = await Promise.all(entries.map(normalizeCreateEntry));
+		const caseInsensitivePaths = process.platform === 'win32' || process.platform === 'darwin';
+		const pathKeys = normalizedEntries.map(entry =>
+			caseInsensitivePaths ? entry.path.toLowerCase() : entry.path);
+		const archivePaths = new Set(pathKeys);
+		if(archivePaths.size !== normalizedEntries.length)
+		{
+			throw new ArchiveError('ERR_ARCHIVE_PATH', 'Archive creation paths must be unique');
+		}
+		for(const entry of normalizedEntries)
+		{
+			const segments = entry.path.split('/');
+			for(let index = 1; index < segments.length; index++)
+			{
+				const parent = segments.slice(0, index).join('/');
+				const parentKey = caseInsensitivePaths ? parent.toLowerCase() : parent;
+				if(archivePaths.has(parentKey))
+				{
+					throw new ArchiveError(
+						'ERR_ARCHIVE_PATH',
+						`Archive creation file path is a parent of another entry: ${parent}`,
+					);
+				}
+			}
+		}
+		if(options.overwrite)
+		{
+			await assertReplaceableOutput(targetPath);
+		}
+		else
+		{
+			await assertOutputDoesNotExist(targetPath);
+		}
+
+		const temporaryPath = join(dirname(targetPath), `.7zip-native-${randomUUID()}.tmp`);
+		try
+		{
+			await native.create(temporaryPath, format, normalizedEntries, compressionLevel, enginePath);
+			if(options.overwrite)
+			{
+				await assertReplaceableOutput(targetPath);
+				await rename(temporaryPath, targetPath);
+			}
+			else
+			{
+				await link(temporaryPath, targetPath);
+				await rm(temporaryPath);
+			}
+		}
+		catch (cause)
+		{
+			await rm(temporaryPath, {force: true});
+			if(cause instanceof ArchiveError)
+			{
+				throw cause;
+			}
+			throw new ArchiveError('ERR_ARCHIVE_CREATE', errorMessage(cause), {cause});
 		}
 	}
 
