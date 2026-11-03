@@ -29,8 +29,8 @@ try
 
 	if(cover && !cover.isDirectory)
 	{
-		const preview = await archive.read(cover.id, {offset: 0, length: 64 * 1024});
-		const image = await archive.extract(cover.id);
+		const preview = await archive.read(cover.path, {offset: 0, length: 64 * 1024});
+		const image = await archive.extract(cover.path);
 		console.log(entries.length, preview.length, image.length);
 	}
 }
@@ -72,6 +72,8 @@ const byId = await archive.getEntry(0);
 
 `entries()` returns cached metadata. Entry IDs are zero-based and stable for the lifetime of the opened archive. `getEntry()` returns `undefined` if the ID or full path does not match.
 
+All entry-targeted methods accept either the entry's numeric `id` or its exact archive-internal `path`: `extract()`, `read()`, `createReadStream()`, and `extractToStream()`. Batch `extract()` calls can mix IDs and paths. For folder extraction, use either the `ids` or `paths` option; omit both to extract every entry.
+
 Each entry includes:
 
 | Property | Type | Description |
@@ -89,15 +91,16 @@ Each entry includes:
 
 ```ts
 const image = await archive.extract(entry.id); // Buffer
-const pages = await archive.extract([page1.id, page2.id]); // Buffer[]
+const sameImage = await archive.extract(entry.path); // Buffer
+const pages = await archive.extract([page1.id, page2.path]); // Buffer[]
 ```
 
-Batch results are returned in the same order as the requested IDs. A buffered extraction is limited to 256 MiB per entry, with a 512 MiB cap on native results pending transfer to JavaScript. For large entries, use a stream or extract to a folder instead.
+Paths use `/` separators. Batch results are returned in the same order as the requested selectors; duplicate entries are rejected. A missing path rejects with `ERR_INVALID_ENTRY`. A buffered extraction is limited to 256 MiB per entry, with a 512 MiB cap on native results pending transfer to JavaScript. For large entries, use a stream or extract to a folder instead.
 
 ### Reading a byte range
 
 ```ts
-const header = await archive.read(entry.id, {
+const header = await archive.read(entry.path, {
 	offset: 0,
 	length: 64 * 1024,
 });
@@ -110,7 +113,7 @@ Offsets and lengths accept safe integers or `bigint`. A range read returns only 
 Create a standard Node.js `Readable` for a large entry:
 
 ```ts
-for await (const chunk of archive.createReadStream(entry.id, {
+for await (const chunk of archive.createReadStream(entry.path, {
 	highWaterMark: 256 * 1024,
 	signal: abortController.signal,
 }))
@@ -126,7 +129,7 @@ To pipe directly to a Node.js `Writable`:
 ```ts
 import {createWriteStream} from 'node:fs';
 
-await archive.extractToStream(entry.id, createWriteStream('./page.jpg'), {
+await archive.extractToStream(entry.path, createWriteStream('./page.jpg'), {
 	signal: abortController.signal,
 });
 ```
@@ -137,13 +140,13 @@ This respects backpressure and ends the destination when extraction succeeds. A 
 
 ```ts
 await archive.extractToFolder('./unpacked', {
-	ids: [page1.id, page2.id], // omit to extract every entry
+	paths: ['chapter/page1.jpg', 'chapter/page2.jpg'], // alternatively, use ids
 	maxBytes: 2n * 1024n * 1024n * 1024n,
 	signal: abortController.signal,
 });
 ```
 
-Folder extraction is sequential and uses bounded memory. Its default total output limit is 4 GiB; `maxBytes: null` disables that limit. Existing files are never overwritten. Unsafe paths, path collisions, and symlinked destination components are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
+Folder extraction accepts either `ids` or exact `paths`; omit both to extract every entry, and do not provide both together. Paths use archive-internal `/` separators. Extraction is sequential and uses bounded memory. Its default total output limit is 4 GiB; `maxBytes: null` disables that limit. Existing files are never overwritten. Unsafe paths, path collisions, and symlinked destination components are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 
 ### Concurrency
 

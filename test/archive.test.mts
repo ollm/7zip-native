@@ -132,13 +132,19 @@ test('opens, indexes, partially reads, and extracts ZIP entries', async () => {
 		assert.equal(typeof cover.compressedSize, 'bigint');
 		assert.equal(typeof cover.crc, 'number');
 		assert.equal((await archive.read(cover.id, {offset: 0, length: 6})).toString(), 'native');
+		assert.equal((await archive.read('chapter/cover.jpg', {offset: 0, length: 6})).toString(), 'native');
 		assert.equal((await archive.read(cover.id, {offset: 7, length: 4})).toString(), '7-Zi');
 		assert.equal((await archive.read(cover.id, {offset: cover.size, length: 12})).length, 0);
 		assert.equal((await archive.read(cover.id, {offset: 2, length: 0})).length, 0);
 		assert.equal((await archive.extract(cover.id)).toString(), 'native 7-Zip reads this image');
-		const result = await archive.extract(entries.map(entry => entry.id));
+		assert.equal((await archive.extract('chapter/cover.jpg')).toString(), 'native 7-Zip reads this image');
+		const result = await archive.extract([entries[0]!.id, 'empty.txt', '読書/page.txt']);
 		assert.equal(result[1]!.length, 0);
 		assert.equal((await archive.getEntry('読書/page.txt'))?.path, '読書/page.txt');
+		await assert.rejects(
+			archive.extract('missing.txt'),
+			(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_INVALID_ENTRY',
+		);
 	}
 	finally
 	{
@@ -154,7 +160,7 @@ test('streams entry data with backpressure and supports early destruction', asyn
 		assert.ok(entry);
 		const expected = await readFile(join(sampleDirectory, entry.path));
 		const streamed: Buffer[] = [];
-		for await (const chunk of archive.createReadStream(entry.id, {highWaterMark: 1}))
+		for await (const chunk of archive.createReadStream(entry.path, {highWaterMark: 1}))
 		{
 			streamed.push(Buffer.from(chunk));
 		}
@@ -163,7 +169,7 @@ test('streams entry data with backpressure and supports early destruction', asyn
 		assert.ok(streamed.every(chunk => chunk.length <= 64 * 1024));
 		await assert.rejects(
 			(async () => {
-				for await (const _chunk of archive.createReadStream(entry.id, {maxBytes: 1})) {}
+				for await (const _chunk of archive.createReadStream(entry.path, {maxBytes: 1})) {}
 			})(),
 			(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_RESOURCE_LIMIT',
 		);
@@ -176,7 +182,7 @@ test('streams entry data with backpressure and supports early destruction', asyn
 				setTimeout(callback, 1);
 			},
 		});
-		await archive.extractToStream(entry.id, destination);
+		await archive.extractToStream(entry.path, destination);
 		assert.deepEqual(Buffer.concat(backpressured), expected);
 
 		const earlyDestination = new Writable({
@@ -185,7 +191,7 @@ test('streams entry data with backpressure and supports early destruction', asyn
 				this.destroy();
 			},
 		});
-		await assert.rejects(archive.extractToStream(entry.id, earlyDestination));
+		await assert.rejects(		archive.extractToStream(entry.path, earlyDestination));
 
 		const partialStream = archive.createReadStream(entry.id, {highWaterMark: 1});
 		let chunksBeforeClose = 0;
@@ -227,6 +233,23 @@ test('extracts archive entries to a folder without overwriting existing files', 
 		{
 			assert.deepEqual(await readFile(join(destination, entry.path)), expectedFiles.get(entry.path));
 		}
+		const selectedDestination = join(directory, 'extracted-selected');
+		await archive.extractToFolder(selectedDestination, {paths: ['chapter/cover.jpg']});
+		assert.equal(
+			(await readFile(join(selectedDestination, 'chapter/cover.jpg'))).toString(),
+			'native 7-Zip reads this image',
+		);
+		await assert.rejects(
+			archive.extractToFolder(join(directory, 'extracted-invalid'), {
+				ids: [entries[0]!.id],
+				paths: ['chapter/cover.jpg'],
+			}),
+			TypeError,
+		);
+		await assert.rejects(
+			archive.extractToFolder(join(directory, 'extracted-missing'), {paths: ['missing.txt']}),
+			(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_INVALID_ENTRY',
+		);
 		await assert.rejects(
 			archive.extractToFolder(destination),
 			(error: unknown) => error instanceof Error && (error as NodeJS.ErrnoException).code === 'EEXIST',

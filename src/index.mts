@@ -10,6 +10,7 @@ import {
 	ArchiveError,
 	type ArchiveEntry,
 	type EntryId,
+	type EntrySelector,
 	type ExtractToFolderOptions,
 	type OpenOptions,
 	type ReadOptions,
@@ -21,6 +22,7 @@ export type {
 	ArchiveEntry,
 	ArchiveErrorCode,
 	EntryId,
+	EntrySelector,
 	ExtractToFolderOptions,
 	OpenOptions,
 	ReadOptions,
@@ -255,9 +257,10 @@ async function ensureOutputDirectoryTree(root: string, directoryPath: string): P
 class NativeArchiveReadable extends Readable {
 	private streamId?: bigint;
 	private outputBytes = 0n;
+	private starting = false;
 
 	constructor(
-		private readonly start: (callback: NativeStreamCallback) => bigint,
+		private readonly start: (callback: NativeStreamCallback) => bigint | Promise<bigint>,
 		private readonly resumeNative: (streamId: bigint) => void,
 		private readonly cancel: (streamId: bigint) => void,
 		options: ReadStreamOptions,
@@ -267,54 +270,86 @@ class NativeArchiveReadable extends Readable {
 	}
 
 	override _read(): void {
+		if(this.streamId !== undefined)
+		{
+			try
+			{
+				this.resumeNative(this.streamId);
+			}
+			catch (cause)
+			{
+				this.destroy(extractionError(cause));
+			}
+			return;
+		}
+		if(this.starting)
+		{
+			return;
+		}
+
+		this.starting = true;
 		try
 		{
-			if(this.streamId === undefined)
-			{
-				this.streamId = this.start((chunk, error, done) => {
-					if(this.destroyed)
+			Promise.resolve(this.start((chunk, error, done) => {
+				if(this.destroyed)
+				{
+					return;
+				}
+				if(error)
+				{
+					this.destroy(extractionError(error));
+				}
+				else if(done)
+				{
+					this.push(null);
+				}
+				else if(chunk)
+				{
+					if(this.maxBytes !== null
+						&& this.outputBytes + BigInt(chunk.length) > this.maxBytes)
 					{
+						this.destroy(new ArchiveError(
+							'ERR_RESOURCE_LIMIT',
+							`Stream output exceeds the ${this.maxBytes}-byte limit`,
+						));
 						return;
 					}
-					if(error)
+					this.outputBytes += BigInt(chunk.length);
+					this.push(chunk);
+				}
+				else
+				{
+					this.destroy(new ArchiveError(
+						'ERR_ARCHIVE_EXTRACT',
+						'Native stream returned an empty chunk notification',
+					));
+				}
+			})).then((streamId) => {
+				this.streamId = streamId;
+				this.starting = false;
+				try
+				{
+					if(this.destroyed)
 					{
-						this.destroy(extractionError(error));
-					}
-					else if(done)
-					{
-						this.push(null);
-					}
-					else if(chunk)
-					{
-						if(this.maxBytes !== null
-							&& this.outputBytes + BigInt(chunk.length) > this.maxBytes)
-						{
-							this.destroy(new ArchiveError(
-								'ERR_RESOURCE_LIMIT',
-								`Stream output exceeds the ${this.maxBytes}-byte limit`,
-							));
-							return;
-						}
-						this.outputBytes += BigInt(chunk.length);
-						this.push(chunk);
+						this.cancel(streamId);
 					}
 					else
 					{
-						this.destroy(new ArchiveError(
-							'ERR_ARCHIVE_EXTRACT',
-							'Native stream returned an empty chunk notification',
-						));
+						this.resumeNative(streamId);
 					}
-				});
-				this.resumeNative(this.streamId);
-			}
-			else
-			{
-				this.resumeNative(this.streamId);
-			}
+				}
+				catch (cause)
+				{
+					this.destroy(extractionError(cause));
+				}
+			}, (cause: unknown) => {
+				this.starting = false;
+				this.destroy(extractionError(cause));
+			});
 		}
 		catch (cause)
 		{
+			this.starting = false;
 			this.destroy(extractionError(cause));
 		}
 	}
@@ -393,7 +428,7 @@ export class Archive {
 		return this.entriesPromise;
 	}
 
-	async getEntry(idOrPath: EntryId | string): Promise<ArchiveEntry | undefined> {
+	async getEntry(idOrPath: EntrySelector): Promise<ArchiveEntry | undefined> {
 		if(typeof idOrPath === 'number' && (!Number.isSafeInteger(idOrPath) || idOrPath < 0))
 		{
 			throw new RangeError('Entry ID must be a non-negative safe integer');
@@ -402,16 +437,35 @@ export class Archive {
 			typeof idOrPath === 'number' ? entry.id === idOrPath : entry.path === idOrPath);
 	}
 
-	async extract(id: EntryId): Promise<Buffer>;
-	async extract(ids: readonly EntryId[]): Promise<Buffer[]>;
-	async extract(idOrIds: EntryId | readonly EntryId[]): Promise<Buffer | Buffer[]> {
+	async extract(idOrPath: EntrySelector): Promise<Buffer>;
+	async extract(idsOrPaths: readonly EntrySelector[]): Promise<Buffer[]>;
+	async extract(idOrPathOrPaths: EntrySelector | readonly EntrySelector[]): Promise<Buffer | Buffer[]> {
 		this.assertOpen();
-		const ids = Array.isArray(idOrIds) ? [...idOrIds] : [idOrIds as number];
-		this.validateIds(ids);
+		const isBatch = Array.isArray(idOrPathOrPaths);
+		let selectors: readonly EntrySelector[];
+		if(isBatch)
+		{
+			selectors = idOrPathOrPaths as readonly EntrySelector[];
+		}
+		else
+		{
+			selectors = [idOrPathOrPaths as EntrySelector];
+		}
+		const numericIds = selectors.filter((selector): selector is EntryId => typeof selector === 'number');
+		let ids: EntryId[];
+		if(numericIds.length === selectors.length)
+		{
+			this.validateIds(numericIds);
+			ids = numericIds;
+		}
+		else
+		{
+			ids = await this.resolveEntryIds(selectors);
+		}
 		try
 		{
 			const buffers = await native.extract(this.handle, ids);
-			return Array.isArray(idOrIds) ? buffers : buffers[0];
+			return isBatch ? buffers : buffers[0];
 		}
 		catch (cause)
 		{
@@ -419,9 +473,16 @@ export class Archive {
 		}
 	}
 
-	createReadStream(id: EntryId, options: ReadStreamOptions = {}): Readable {
+	createReadStream(idOrPath: EntrySelector, options: ReadStreamOptions = {}): Readable {
 		this.assertOpen();
-		this.validateIds([id]);
+		if(typeof idOrPath === 'number')
+		{
+			this.validateIds([idOrPath]);
+		}
+		else if(typeof idOrPath !== 'string')
+		{
+			throw new TypeError('Entry selector must be an ID or archive path');
+		}
 		if(!options || typeof options !== 'object')
 		{
 			throw new TypeError('Stream options must be an object');
@@ -436,7 +497,13 @@ export class Archive {
 		options.signal?.throwIfAborted();
 		const maxBytes = normalizeMaxBytes(options.maxBytes, 'maxBytes');
 		return new NativeArchiveReadable(
-			callback => native.startStream(this.handle, id, callback),
+			(callback) => {
+				if(typeof idOrPath === 'number')
+				{
+					return native.startStream(this.handle, idOrPath, callback);
+				}
+				return this.resolveEntryId(idOrPath).then(id => native.startStream(this.handle, id, callback));
+			},
 			streamId => native.resumeStream(streamId),
 			streamId => native.cancelStream(streamId),
 			options,
@@ -445,7 +512,7 @@ export class Archive {
 	}
 
 	async extractToStream(
-		id: EntryId,
+		idOrPath: EntrySelector,
 		destination: Writable,
 		options: ReadStreamOptions = {},
 	): Promise<void> {
@@ -453,7 +520,7 @@ export class Archive {
 		{
 			throw new TypeError('Destination must be a writable stream');
 		}
-		await pipeline(this.createReadStream(id, options), destination, {signal: options.signal});
+		await pipeline(this.createReadStream(idOrPath, options), destination, {signal: options.signal});
 	}
 
 	async extractToFolder(
@@ -473,6 +540,10 @@ export class Archive {
 		const maxBytes = normalizeMaxBytes(options.maxBytes, 'maxBytes');
 		const entries = await this.entries();
 		let selectedEntries: readonly ArchiveEntry[] = entries;
+		if(options.ids !== undefined && options.paths !== undefined)
+		{
+			throw new TypeError('Specify either folder extraction IDs or paths, not both');
+		}
 		if(options.ids !== undefined)
 		{
 			if(!Array.isArray(options.ids))
@@ -482,6 +553,24 @@ export class Archive {
 			this.validateIds(options.ids);
 			const entriesById = new Map(entries.map(entry => [entry.id, entry]));
 			selectedEntries = options.ids.map((id) => {
+				const entry = entriesById.get(id);
+				if(!entry)
+				{
+					throw new ArchiveError('ERR_INVALID_ENTRY', `Entry ID ${id} is out of range`);
+				}
+				return entry;
+			});
+		}
+		else if(options.paths !== undefined)
+		{
+			if(!Array.isArray(options.paths)
+				|| options.paths.some(entryPath => typeof entryPath !== 'string'))
+			{
+				throw new TypeError('Folder extraction paths must be an array of strings');
+			}
+			const ids = await this.resolveEntryIds(options.paths);
+			const entriesById = new Map(entries.map(entry => [entry.id, entry]));
+			selectedEntries = ids.map((id) => {
 				const entry = entriesById.get(id);
 				if(!entry)
 				{
@@ -545,9 +634,18 @@ export class Archive {
 		}
 	}
 
-	async read(id: EntryId, options: ReadOptions): Promise<Buffer> {
+	async read(idOrPath: EntrySelector, options: ReadOptions): Promise<Buffer> {
 		this.assertOpen();
-		this.validateIds([id]);
+		let id: EntryId;
+		if(typeof idOrPath === 'number')
+		{
+			this.validateIds([idOrPath]);
+			id = idOrPath;
+		}
+		else
+		{
+			id = await this.resolveEntryId(idOrPath);
+		}
 		const offset = this.toUnsignedBigInt(options.offset ?? 0, 'offset');
 		const length = this.toUnsignedBigInt(options.length, 'length');
 		const maxUInt64 = (1n << 64n) - 1n;
@@ -586,6 +684,30 @@ export class Archive {
 		{
 			throw new ArchiveError('ERR_INVALID_ENTRY', 'Entry IDs must be unique non-negative safe integers');
 		}
+	}
+
+	private async resolveEntryId(selector: EntrySelector): Promise<EntryId> {
+		if(typeof selector === 'number')
+		{
+			this.validateIds([selector]);
+			return selector;
+		}
+		if(typeof selector !== 'string')
+		{
+			throw new TypeError('Entry selector must be an ID or archive path');
+		}
+		const entry = await this.getEntry(selector);
+		if(!entry)
+		{
+			throw new ArchiveError('ERR_INVALID_ENTRY', `Archive entry "${selector}" was not found`);
+		}
+		return entry.id;
+	}
+
+	private async resolveEntryIds(selectors: readonly EntrySelector[]): Promise<EntryId[]> {
+		const ids = await Promise.all(selectors.map(selector => this.resolveEntryId(selector)));
+		this.validateIds(ids);
+		return ids;
 	}
 
 	private toUnsignedBigInt(value: number | bigint, label: string): bigint {

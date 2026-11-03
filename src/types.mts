@@ -1,4 +1,5 @@
 export type EntryId = number;
+export type EntrySelector = EntryId | string;
 
 export interface ArchiveEntry {
 	readonly id: EntryId;
@@ -28,6 +29,7 @@ export interface ReadStreamOptions {
 
 export interface ExtractToFolderOptions {
 	readonly ids?: readonly EntryId[];
+	readonly paths?: readonly string[];
 	readonly maxBytes?: number | bigint | null;
 	readonly signal?: AbortSignal;
 }
