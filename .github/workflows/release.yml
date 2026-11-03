@@ -32,8 +32,10 @@ jobs:
             runner: macos-15
           - target: win32-x64
             runner: windows-2025-vs2026
+            msvc-arch: x64
           - target: win32-arm64
             runner: windows-11-arm
+            msvc-arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +45,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc-arch }}
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm test
