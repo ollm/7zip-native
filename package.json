@@ -30,6 +30,7 @@
 		"dist/",
 		"prebuilds/",
 		"native/",
+		"scripts/",
 		"vendor/7zip/",
 		"binding.gyp",
 		"README.md",
@@ -48,6 +49,7 @@
 		"url": "https://github.com/sponsors/ollm"
 	},
 	"scripts": {
+		"install": "node scripts/verify-prebuild.mjs",
 		"prepare": "npm run build && node scripts/clean-upstream-build.mjs",
 		"build": "npm run build:native && npm run eslint && npx rollup -c && npm run typecheck",
 		"build:native": "node scripts/build-native.mjs",
