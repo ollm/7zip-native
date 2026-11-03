@@ -71,6 +71,7 @@
 		"@types/node": "^26.6.5",
 		"7zip-bin-full": "^26.5.1",
 		"eslint": "^10.13.0",
+		"globals": "^17.14.0",
 		"jiti": "^2.7.0",
 		"node-gyp": "^12.4.0",
 		"rollup": "^4.64.7",

@@ -1,5 +1,5 @@
 > [!CAUTION]
-> This project was generated with the assistance of an LLM and may contain errors. Review and validate it before use, especially in production.
+> This project was generated primarily by an LLM and may contain errors. Review and validate it before use, especially in production.
 
 # 7zip-native
 
