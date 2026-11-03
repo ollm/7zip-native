@@ -315,6 +315,17 @@ npm run benchmark:concurrency -- \
 
 The report includes median and p95 latency, throughput, speedup, and the number of entries that can overlap. `--max-files` selects evenly spaced entries, which is useful when sampling solid archives. Benchmarks report measurements only; results depend on the archive, machine, and workload and do not guarantee a speedup.
 
+Compare `extractToFolder()` concurrency (1 through 16) across one or more archives:
+
+```sh
+npm run benchmark:folder-concurrency -- \
+	--archive "./samples/sample.zip" \
+	--archive "./archive.7z" \
+	--iterations 1
+```
+
+Each run extracts one archive into a temporary directory, verifies the completed file and byte counts, and removes the output before continuing. The default is one iteration per concurrency; increase `--iterations` for more stable measurements. The global worker pool is set to 16 for the benchmark and restored afterward.
+
 ## License
 
 This package is MIT-licensed. The integrated 7-Zip code and other bundled dependencies have their own licensing terms; see [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) before redistribution.
