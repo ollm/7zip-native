@@ -5,7 +5,7 @@
 
 Native Node-API bindings for the 7-Zip archive engine. Parsing and extraction through the `Archive` API run in native worker tasks and never invoke `7z`, `7zz`, or another archive executable. The optional comparison benchmark invokes `7zip-bin-full` only as a command-line baseline.
 
-> **Platform status:** the release workflow builds and tests Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64. This checkout has only been verified locally on Linux x64 with Node.js 22; do not treat other targets as tested until the corresponding GitHub Actions runs pass. This remains an early end-to-end implementation, not a claim of full parity with every requirement in the project specification.
+> **Platform status:** the release workflow builds and tests Linux x64/arm64, macOS x64/arm64, and Windows x64/arm64/x86. Linux x86 (ia32) and ARM32 artifacts are cross-compiled and checked for their target architecture, but are not runtime-tested in CI. This checkout has only been verified locally on Linux x64 with Node.js 22; do not treat other targets as runtime-tested until the corresponding GitHub Actions runs pass. This remains an early end-to-end implementation, not a claim of full parity with every requirement in the project specification.
 
 ## Build from source
 
@@ -19,7 +19,7 @@ npm test
 
 Source builds require a C++17 toolchain, Python 3, Node.js headers (downloaded by `node-gyp`), and the upstream submodule. Linux and macOS use GNU make; Windows builds the upstream bundle with `nmake` and Visual C++ build tools. `npm run build:native` compiles the `Format7zF` handler bundle and Node-API addon, then stages both under `prebuilds/<platform>-<arch>/`. Archive operations never shell out.
 
-The `Build and publish` GitHub Actions workflow builds and runs tests on all six targets for version tags (`v*`) or a manual dispatch. For manual runs, publishing is off by default; enable it only when dispatching the matching `v<package-version>` tag. npm publishing uses trusted publishing (OIDC), so configure this repository as a trusted publisher in npm before publishing. The release matrix uses GitHub-hosted arm64 runners and depends on their availability for the repository.
+The `Build and publish` GitHub Actions workflow builds the nine listed targets for version tags (`v*`) or a manual dispatch. It runs tests on the seven native-runner targets; Linux x86 (ia32) and ARM32 use cross-compilers and receive architecture checks because the runners are x64. For manual runs, publishing is off by default; enable it only when dispatching the matching `v<package-version>` tag. npm publishing uses trusted publishing (OIDC), so configure this repository as a trusted publisher in npm before publishing. The release matrix uses GitHub-hosted arm64 runners and depends on their availability for the repository.
 
 To update upstream deliberately:
 

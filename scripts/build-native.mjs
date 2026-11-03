@@ -8,7 +8,8 @@ import {fileURLToPath} from 'node:url';
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const bundleDirectory = join(root, 'vendor', '7zip', 'CPP', '7zip', 'Bundles', 'Format7zF');
 const releaseDirectory = join(root, 'build', 'Release');
-const target = `${process.platform}-${process.arch}`;
+const targetArch = process.env.BUILD_ARCH || process.arch;
+const target = `${process.platform}-${targetArch}`;
 const engineName = process.platform === 'win32'
 	? '7z.dll'
 	: process.platform === 'darwin' ? 'lib7z.dylib' : '7z.so';
@@ -34,7 +35,8 @@ function run(command, args, cwd, env = process.env)
 
 if(process.platform === 'win32')
 {
-	await run('nmake', ['/f', 'makefile', `PLATFORM=${process.arch}`], bundleDirectory);
+	const upstreamArch = targetArch === 'ia32' ? 'x86' : targetArch;
+	await run('nmake', ['/f', 'makefile', `PLATFORM=${upstreamArch}`], bundleDirectory);
 }
 else
 {
@@ -45,6 +47,26 @@ else
 		'makefile.gcc',
 		`-j${process.env.BUILD_JOBS ?? Math.min(availableParallelism(), 2)}`,
 	];
+	const buildEnv = {...process.env};
+	if(targetArch === 'ia32')
+	{
+		args.push('MY_ARCH=-m32', 'CC=gcc', 'CXX=g++');
+		buildEnv.CXXFLAGS = `${buildEnv.CXXFLAGS ?? ''} -m32`.trim();
+		buildEnv.LDFLAGS = `${buildEnv.LDFLAGS ?? ''} -m32`.trim();
+	}
+	else if(targetArch === 'arm')
+	{
+		const compilerPrefix = 'arm-linux-gnueabihf-';
+		args.push(
+			`CC=${compilerPrefix}gcc`,
+			`CXX=${compilerPrefix}g++`,
+			'MY_ARCH=-march=armv7-a -mfloat-abi=hard',
+		);
+		buildEnv.CC = `${compilerPrefix}gcc`;
+		buildEnv.CXX = `${compilerPrefix}g++`;
+		buildEnv.CXXFLAGS = `${buildEnv.CXXFLAGS ?? ''} -march=armv7-a -mfloat-abi=hard`.trim();
+		buildEnv.LDFLAGS = `${buildEnv.LDFLAGS ?? ''} -march=armv7-a -mfloat-abi=hard`.trim();
+	}
 	if(process.platform === 'darwin')
 	{
 		args.push(
@@ -54,16 +76,36 @@ else
 			'LDFLAGS=-shared -fPIC -Wl,-install_name,@rpath/lib7z.dylib',
 		);
 	}
-	await run('make', args, root);
+	await run('make', args, root, buildEnv);
 }
 
 const upstreamEnginePath = process.platform === 'win32'
-	? join(bundleDirectory, process.arch, engineName)
+	? join(bundleDirectory, targetArch === 'ia32' ? 'x86' : targetArch, engineName)
 	: join(bundleDirectory, '_o', engineName);
-await run(process.execPath, [
+const nodeGypArgs = [
 	require.resolve('node-gyp/bin/node-gyp.js'),
 	'rebuild',
-], root);
+];
+const nodeGypEnv = {...process.env};
+if(targetArch !== process.arch)
+{
+	nodeGypArgs.push(`--arch=${targetArch}`);
+	if(targetArch === 'ia32')
+	{
+		nodeGypEnv.CC = 'gcc';
+		nodeGypEnv.CXX = 'g++';
+		nodeGypEnv.CXXFLAGS = `${nodeGypEnv.CXXFLAGS ?? ''} -m32`.trim();
+		nodeGypEnv.LDFLAGS = `${nodeGypEnv.LDFLAGS ?? ''} -m32`.trim();
+	}
+	else if(targetArch === 'arm')
+	{
+		nodeGypEnv.CC = 'arm-linux-gnueabihf-gcc';
+		nodeGypEnv.CXX = 'arm-linux-gnueabihf-g++';
+		nodeGypEnv.CXXFLAGS = `${nodeGypEnv.CXXFLAGS ?? ''} -march=armv7-a -mfloat-abi=hard`.trim();
+		nodeGypEnv.LDFLAGS = `${nodeGypEnv.LDFLAGS ?? ''} -march=armv7-a -mfloat-abi=hard`.trim();
+	}
+}
+await run(process.execPath, nodeGypArgs, root, nodeGypEnv);
 
 await mkdir(releaseDirectory, {recursive: true});
 const releaseEnginePath = join(releaseDirectory, engineName);

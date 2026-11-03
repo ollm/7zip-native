@@ -24,18 +24,36 @@ jobs:
         include:
           - target: linux-x64
             runner: ubuntu-24.04
+            node-arch: x64
+          - target: linux-ia32
+            runner: ubuntu-24.04
+            build-arch: ia32
+            node-arch: x64
+          - target: linux-arm
+            runner: ubuntu-24.04
+            build-arch: arm
+            node-arch: x64
           - target: linux-arm64
             runner: ubuntu-24.04-arm
+            node-arch: arm64
           - target: darwin-x64
             runner: macos-15-intel
+            node-arch: x64
           - target: darwin-arm64
             runner: macos-15
+            node-arch: arm64
           - target: win32-x64
             runner: windows-2025-vs2026
             msvc-arch: x64
+            node-arch: x64
+          - target: win32-ia32
+            runner: windows-2025-vs2026
+            msvc-arch: x86
+            node-arch: x86
           - target: win32-arm64
             runner: windows-11-arm
             msvc-arch: arm64
+            node-arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -44,15 +62,40 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          architecture: ${{ matrix.node-arch }}
           cache: npm
       - name: Set up MSVC environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: ${{ matrix.msvc-arch }}
+      - name: Install Linux cross-compilers
+        if: matrix.target == 'linux-ia32' || matrix.target == 'linux-arm'
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.target }}" = "linux-ia32" ]; then
+            sudo apt-get install -y gcc-multilib g++-multilib
+          else
+            sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+          fi
       - run: npm ci --ignore-scripts
       - run: npm run build
+        env:
+          BUILD_ARCH: ${{ matrix.build-arch }}
       - run: npm test
+        if: matrix.target != 'linux-ia32' && matrix.target != 'linux-arm'
+      - name: Verify Linux cross-compiled binaries
+        if: matrix.target == 'linux-ia32' || matrix.target == 'linux-arm'
+        shell: bash
+        run: |
+          file prebuilds/${{ matrix.target }}/7zip_native.node prebuilds/${{ matrix.target }}/7z.so
+          if [ "${{ matrix.target }}" = "linux-ia32" ]; then
+            file prebuilds/${{ matrix.target }}/7zip_native.node | grep -q 'ELF 32-bit.*Intel 80386'
+            file prebuilds/${{ matrix.target }}/7z.so | grep -q 'ELF 32-bit.*Intel 80386'
+          else
+            file prebuilds/${{ matrix.target }}/7zip_native.node | grep -q 'ELF 32-bit.*ARM'
+            file prebuilds/${{ matrix.target }}/7z.so | grep -q 'ELF 32-bit.*ARM'
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: prebuild-${{ matrix.target }}
@@ -86,7 +129,7 @@ jobs:
       - name: Assemble platform prebuilds
         shell: bash
         run: |
-          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
+          for target in linux-x64 linux-ia32 linux-arm linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-ia32 win32-arm64; do
             mkdir -p "prebuilds/$target"
             cp -R "prebuild-artifacts/prebuild-$target/." "prebuilds/$target/"
           done
@@ -101,7 +144,7 @@ jobs:
             if (process.env.GITHUB_REF_NAME !== `v${version}`) {
               throw new Error(`Tag v${version} is required; found ${process.env.GITHUB_REF_NAME}`);
             }
-            for (const target of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64"]) {
+            for (const target of ["linux-x64", "linux-ia32", "linux-arm", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-ia32", "win32-arm64"]) {
               for (const file of ["7zip_native.node", target.startsWith("win32-") ? "7z.dll" : "7z.so"]) {
                 readFileSync(`prebuilds/${target}/${file}`);
               }
