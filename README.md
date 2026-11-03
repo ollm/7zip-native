@@ -200,16 +200,16 @@ See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) for third-party redistrib
 
 ## Platform support
 
-The release workflow builds nine targets:
+The release workflow builds eight targets:
 
 | Platform | Architecture | CI verification |
 | --- | --- | --- |
 | Linux | x64, ARM64 | Build and runtime tests |
 | Linux | x86 (ia32), ARM32 | Cross-compile and verify binary architecture; not runtime-tested in CI |
 | macOS | x64, ARM64 | Build and runtime tests |
-| Windows | x64, x86 (ia32), ARM64 | Build and runtime tests |
+| Windows | x64, ARM64 | Build and runtime tests |
 
-The published binaries must match the target operating system and architecture. The package declares Node.js `>=18`; the workflow currently builds and tests with Node.js 22. This checkout has been verified locally on Linux x64. Do not treat cross-compiled Linux 32-bit artifacts as runtime-tested.
+The published binaries must match the target operating system and architecture. Windows x86 (ia32) prebuilds are not published. The package declares Node.js `>=18`; the workflow currently builds and tests with Node.js 26. This checkout has been verified locally on Linux x64. Do not treat cross-compiled Linux 32-bit artifacts as runtime-tested.
 
 ## Electron
 
