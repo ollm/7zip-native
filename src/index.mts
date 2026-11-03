@@ -30,6 +30,7 @@ export type {
 	CreateArchiveOptions,
 	EntryId,
 	EntrySelector,
+	ExtractedArchiveFile,
 	ExtractToFolderProgress,
 	ExtractToFolderOptions,
 	OpenOptions,
@@ -153,11 +154,41 @@ function safeEntrySegments(entryPath: string): string[]
 	return segments;
 }
 
+function sanitizeOutputPath(entryPath: string): string
+{
+	if(process.platform !== 'win32')
+	{
+		return entryPath;
+	}
+	return entryPath
+		.replace(/([. ]+)([\\/]|$)/g, (_match, unsupported: string, separator: string) =>
+			'_'.repeat(unsupported.length) + separator)
+		.replace(/[<>:|?*"]/g, '_');
+}
+
+function assertSafeRelativeArchivePath(entryPath: string): void
+{
+	const normalized = entryPath.replace(/\\/g, '/');
+	const segments = normalized.split('/').filter(segment => segment !== '' && segment !== '.');
+	if(entryPath.includes('\0')
+		|| normalized.startsWith('/')
+		|| /^[a-zA-Z]:/.test(normalized)
+		|| segments.length === 0
+		|| segments.some(segment => segment === '..'))
+	{
+		throw new ArchiveError('ERR_ARCHIVE_PATH', `Unsafe archive entry path: ${entryPath}`);
+	}
+}
+
 function makeOutputPlans(root: string, entries: readonly ArchiveEntry[]): OutputPlan[]
 {
 	const caseInsensitivePaths = process.platform === 'win32' || process.platform === 'darwin';
 	const plans = entries.map((entry) => {
-		const segments = safeEntrySegments(entry.path);
+		if(process.platform === 'win32')
+		{
+			assertSafeRelativeArchivePath(entry.path);
+		}
+		const segments = safeEntrySegments(sanitizeOutputPath(entry.path));
 		const targetPath = resolve(root, ...segments);
 		const relative = relativePath(root, targetPath);
 		if(relative === ''
@@ -760,6 +791,10 @@ export class Archive {
 		{
 			throw new TypeError('Folder extraction onProgress option must be a function');
 		}
+		if(options.onExtract !== undefined && typeof options.onExtract !== 'function')
+		{
+			throw new TypeError('Folder extraction onExtract option must be a function');
+		}
 		options.signal?.throwIfAborted();
 		const maxBytes = normalizeMaxBytes(options.maxBytes, 'maxBytes');
 		const entries = await this.entries();
@@ -914,6 +949,7 @@ export class Archive {
 			}
 			filesExtracted++;
 			reportProgress();
+			options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
 		}
 	}
 

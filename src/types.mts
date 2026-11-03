@@ -42,6 +42,11 @@ export interface ExtractToFolderProgress {
 	readonly percent: number;
 }
 
+export interface ExtractedArchiveFile {
+	readonly entry: ArchiveEntry;
+	readonly outputPath: string;
+}
+
 export interface ReadStreamOptions {
 	readonly highWaterMark?: number;
 	readonly maxBytes?: number | bigint | null;
@@ -53,6 +58,7 @@ export interface ExtractToFolderOptions {
 	readonly paths?: readonly string[];
 	readonly overwrite?: boolean;
 	readonly onProgress?: (progress: ExtractToFolderProgress) => void;
+	readonly onExtract?: (result: ExtractedArchiveFile) => void;
 	readonly maxBytes?: number | bigint | null;
 	readonly signal?: AbortSignal;
 }

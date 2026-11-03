@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
+import {readFileSync} from 'node:fs';
 import {mkdir, mkdtemp, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
@@ -9,7 +10,7 @@ import {after, before, test} from 'node:test';
 import {promisify} from 'node:util';
 import {fileURLToPath} from 'node:url';
 import {gzipSync} from 'node:zlib';
-import {Archive, ArchiveError} from '../dist/index.mjs';
+import {Archive, ArchiveError, type ArchiveEntry} from '../dist/index.mjs';
 
 const execFileAsync = promisify(execFile);
 const sevenZip = createRequire(import.meta.url)('7zip-bin-full') as {path7z: string};
@@ -85,6 +86,21 @@ function makeStoredZip(files: ReadonlyArray<{name: string; data: string}>): Buff
 	end.writeUInt32LE(centralDirectory.length, 12);
 	end.writeUInt32LE(localOffset, 16);
 	return Buffer.concat([...localParts, centralDirectory, end]);
+}
+
+async function withPlatform(platform: string, operation: () => Promise<void>): Promise<void>
+{
+	const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+	assert.ok(descriptor?.configurable);
+	Object.defineProperty(process, 'platform', {...descriptor, value: platform});
+	try
+	{
+		await operation();
+	}
+	finally
+	{
+		Object.defineProperty(process, 'platform', descriptor);
+	}
 }
 
 let directory = '';
@@ -326,6 +342,145 @@ test('extracts archive entries to a folder without overwriting existing files', 
 			overwrite: true,
 		});
 		assert.equal((await readFile(coverPath)).toString(), 'native 7-Zip reads this image');
+	}
+	finally
+	{
+		await archive.close();
+	}
+});
+
+test('calls onExtract once per file after final output is ready', async () => {
+	const archive = await Archive.open(archivePath);
+	const destination = join(directory, 'extracted-callback');
+	const coverPath = join(destination, 'chapter/cover.jpg');
+	const emptyPath = join(destination, 'empty.txt');
+	await mkdir(join(destination, 'chapter'), {recursive: true});
+	await writeFile(coverPath, 'old cover');
+	await writeFile(emptyPath, 'old empty');
+	const expected = new Map([
+		['chapter/cover.jpg', Buffer.from('native 7-Zip reads this image')],
+		['empty.txt', Buffer.alloc(0)],
+	]);
+	const extracted: Array<{entry: ArchiveEntry; outputPath: string}> = [];
+	try
+	{
+		await archive.extractToFolder(destination, {
+			paths: ['chapter/cover.jpg', 'empty.txt'],
+			overwrite: true,
+			onExtract: (result) => {
+				extracted.push(result);
+				assert.deepEqual(readFileSync(result.outputPath), expected.get(result.entry.path));
+			},
+		});
+		assert.deepEqual(extracted.map(result => ({
+			path: result.entry.path,
+			outputPath: result.outputPath,
+		})), [
+			{path: 'chapter/cover.jpg', outputPath: coverPath},
+			{path: 'empty.txt', outputPath: emptyPath},
+		]);
+	}
+	finally
+	{
+		await archive.close();
+	}
+});
+
+test('sanitizes Windows output paths without changing path selectors or entry metadata', async () => {
+	const archivePath = join(directory, 'windows-output-paths.zip');
+	const internalPath = 'folder. /bad<>:|?*". ';
+	await writeFile(archivePath, makeStoredZip([{name: internalPath, data: 'sanitized'}]));
+	const archive = await Archive.open(archivePath);
+	const [entry] = await archive.entries();
+	assert.ok(entry);
+	const byPathDestination = join(directory, 'windows-output-by-path');
+	const byIdDestination = join(directory, 'windows-output-by-id');
+	const sanitizedPath = join(byPathDestination, 'folder__', 'bad_________');
+	try
+	{
+		await withPlatform('win32', async () => {
+			const events: Array<{entry: ArchiveEntry; outputPath: string}> = [];
+			await archive.extractToFolder(byPathDestination, {
+				paths: [internalPath],
+				onExtract: (result) => events.push(result),
+			});
+			assert.deepEqual(events, [{entry, outputPath: sanitizedPath}]);
+			await archive.extractToFolder(byIdDestination, {ids: [entry.id]});
+		});
+		assert.equal((await readFile(sanitizedPath)).toString(), 'sanitized');
+		assert.equal(
+			(await readFile(join(byIdDestination, 'folder__', 'bad_________'))).toString(),
+			'sanitized',
+		);
+		assert.equal(entry.path, internalPath);
+	}
+	finally
+	{
+		await archive.close();
+	}
+});
+
+test('rejects Windows-sanitized traversal and path collisions', async () => {
+	const traversalArchivePath = join(directory, 'windows-traversal.zip');
+	const collisionArchivePath = join(directory, 'windows-collision.zip');
+	await writeFile(traversalArchivePath, makeStoredZip([{name: '../escape.txt', data: 'outside'}]));
+	await writeFile(collisionArchivePath, makeStoredZip([
+		{name: 'same<.txt', data: 'first'},
+		{name: 'same>.txt', data: 'second'},
+	]));
+	const traversalArchive = await Archive.open(traversalArchivePath);
+	const collisionArchive = await Archive.open(collisionArchivePath);
+	const traversalDestination = join(directory, 'windows-traversal-output');
+	const collisionDestination = join(directory, 'windows-collision-output');
+	try
+	{
+		await withPlatform('win32', async () => {
+			await assert.rejects(
+				traversalArchive.extractToFolder(traversalDestination),
+				(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_ARCHIVE_PATH',
+			);
+			await assert.rejects(
+				collisionArchive.extractToFolder(collisionDestination),
+				(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_ARCHIVE_PATH',
+			);
+		});
+		await assert.rejects(readFile(traversalDestination), {code: 'ENOENT'});
+		await assert.rejects(readFile(collisionDestination), {code: 'ENOENT'});
+		await assert.rejects(readFile(join(directory, 'escape.txt')), {code: 'ENOENT'});
+	}
+	finally
+	{
+		await Promise.all([traversalArchive.close(), collisionArchive.close()]);
+	}
+});
+
+test('rejects symlinked Windows-sanitized output parents', async (context) => {
+	const archivePath = join(directory, 'windows-symlink.zip');
+	const destination = join(directory, 'windows-symlink-output');
+	const outside = join(directory, 'windows-symlink-target');
+	await writeFile(archivePath, makeStoredZip([{name: 'dir. /file?.txt', data: 'outside'}]));
+	await mkdir(destination, {recursive: true});
+	await mkdir(outside);
+	try
+	{
+		await symlink(outside, join(destination, 'dir__'), 'dir');
+	}
+	catch(error)
+	{
+		context.skip(`Directory symlinks are unavailable: ${String(error)}`);
+		return;
+	}
+
+	const archive = await Archive.open(archivePath);
+	try
+	{
+		await withPlatform('win32', async () => {
+			await assert.rejects(
+				archive.extractToFolder(destination),
+				(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_ARCHIVE_PATH',
+			);
+		});
+		await assert.rejects(readFile(join(outside, 'file_.txt')), {code: 'ENOENT'});
 	}
 	finally
 	{
