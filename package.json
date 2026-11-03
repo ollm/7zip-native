@@ -1,6 +1,6 @@
 {
 	"name": "7zip-native",
-	"version": "0.0.2",
+	"version": "0.0.3",
 	"description": "Native 7zip bindings for Node.js",
 	"main": "./dist/index.cjs",
 	"type": "module",
