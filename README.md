@@ -13,7 +13,7 @@ The package includes the native addon and the matching 7-Zip engine for each sup
 npm install 7zip-native
 ```
 
-The package requires Node.js 18 or newer. The release workflow builds and tests with Node.js 22.
+The package requires Node.js 18 or newer.
 
 ## Quick start
 
@@ -200,16 +200,15 @@ See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) for third-party redistrib
 
 ## Platform support
 
-The release workflow builds eight targets:
+The package includes prebuilt binaries for:
 
-| Platform | Architecture | CI verification |
-| --- | --- | --- |
-| Linux | x64, ARM64 | Build and runtime tests |
-| Linux | x86 (ia32), ARM32 | Cross-compile and verify binary architecture; not runtime-tested in CI |
-| macOS | x64, ARM64 | Build and runtime tests |
-| Windows | x64, ARM64 | Build and runtime tests |
+| Platform | Architectures |
+| --- | --- |
+| Linux | x64, x86 (ia32), ARM32, ARM64 |
+| macOS | x64, ARM64 |
+| Windows | x64, ARM64 |
 
-The published binaries must match the target operating system and architecture. Windows x86 (ia32) prebuilds are not published. The package declares Node.js `>=18`; the workflow currently builds and tests with Node.js 26. This checkout has been verified locally on Linux x64. Do not treat cross-compiled Linux 32-bit artifacts as runtime-tested.
+Windows x86 (ia32) is not supported by the published prebuilt binaries.
 
 ## Electron
 
