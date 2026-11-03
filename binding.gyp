@@ -36,6 +36,7 @@
 					}
 				}],
 				["OS=='win'", {
+					"sources": ["vendor/7zip/CPP/Windows/PropVariant.cpp"],
 					"libraries": ["OleAut32.lib"],
 					"msvs_settings": {
 						"VCCLCompilerTool": {
