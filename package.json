@@ -1,0 +1,84 @@
+{
+	"name": "7zip-native",
+	"version": "0.0.1",
+	"description": "Native 7zip bindings for Node.js",
+	"main": "./dist/index.cjs",
+	"type": "module",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": {
+				"types": "./dist/index.d.mts",
+				"default": "./dist/index.mjs"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
+		}
+	},
+	"author": "Oleguer Llopart <oleguer.llopart.mora@gmail.com> (https://github.com/ollm)",
+	"homepage": "https://github.com/ollm/7zip-native#readme",
+	"bugs": {
+		"url": "https://github.com/ollm/7zip-native/issues"
+	},
+	"license": "MIT",
+	"engines": {
+		"node": ">=18"
+	},
+	"files": [
+		"dist/",
+		"prebuilds/",
+		"native/",
+		"vendor/7zip/",
+		"binding.gyp",
+		"README.md",
+		"LICENSE",
+		"THIRD_PARTY_NOTICES.md",
+		"docs/",
+		"bench/",
+		"examples/"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ollm/7zip-native.git"
+	},
+	"funding": {
+		"type": "github",
+		"url": "https://github.com/sponsors/ollm"
+	},
+	"scripts": {
+		"prepare": "npm run build && node scripts/clean-upstream-build.mjs",
+		"build": "npm run build:native && npm run eslint && npx rollup -c && npm run typecheck",
+		"build:native": "node scripts/build-native.mjs",
+		"eslint": "eslint ./src --ext .ts,.mts,.js,.mjs",
+		"typecheck": "npx tsc --noEmit && npx tsc --ignoreConfig --noEmit --allowImportingTsExtensions --target ESNext --module NodeNext --moduleResolution NodeNext --types node bench/benchmark.mts bench/compare.mts bench/concurrency.mts test/archive.test.mts examples/basic.mts",
+		"test": "node --test test/*.test.mts",
+		"benchmark": "node --experimental-strip-types bench/benchmark.mts",
+		"benchmark:concurrency": "node --experimental-strip-types bench/concurrency.mts",
+		"benchmark:compare": "node --experimental-strip-types bench/compare.mts"
+	},
+	"keywords": [
+		"7zip",
+		"nodejs",
+		"bindings",
+		"native"
+	],
+	"devDependencies": {
+		"@eslint/js": "^10.0.1",
+		"@rollup/plugin-typescript": "^12.3.0",
+		"@stylistic/eslint-plugin": "^5.10.0",
+		"@types/node": "^26.6.5",
+		"7zip-bin-full": "^26.5.1",
+		"eslint": "^10.13.0",
+		"jiti": "^2.7.0",
+		"node-gyp": "^12.4.0",
+		"rollup": "^4.64.7",
+		"rollup-plugin-dts": "^6.5.1",
+		"typescript": "^6.0.3",
+		"typescript-eslint": "^8.71.2"
+	},
+	"dependencies": {
+		"node-addon-api": "^8.9.2"
+	}
+}

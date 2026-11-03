@@ -1,0 +1,13 @@
+node_modules
+dist
+assets
+!assets/example.jpg
+debug
+test-files
+build
+prebuilds
+vendor/7zip/CPP/7zip/Bundles/Format7zF/_o
+
+# OSX
+.DS_Store
+Prompt
