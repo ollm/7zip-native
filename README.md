@@ -23,17 +23,17 @@ The package requires Node.js 18 or newer.
 ```ts
 import {Archive} from '7zip-native';
 
-const archive = await Archive.open('./comics.cbz');
+const archive = await Archive.open('./file.zip');
 
 try
 {
 	const entries = await archive.entries();
-	const cover = await archive.getEntry('chapter/cover.jpg');
+	const file = await archive.getEntry('image.jpg');
 
-	if(cover && !cover.isDirectory)
+	if(file && !file.isDirectory)
 	{
-		const preview = await archive.read(cover.path, {offset: 0, length: 64 * 1024});
-		const image = await archive.extract(cover.path);
+		const preview = await archive.read(file.path, {offset: 0, length: 64 * 1024});
+		const image = await archive.extract(file.path);
 		console.log(entries.length, preview.length, image.length);
 	}
 }
@@ -63,7 +63,9 @@ Opens an archive from a filesystem path and indexes its metadata asynchronously.
 const archive = await Archive.open('./archive.7z', {password: 'secret'});
 ```
 
-`options.password` is passed to the upstream handler when it requests a password. It is held for the lifetime of the archive handle, is not logged, and is limited to 1 MiB of UTF-8 data.
+`Archive.open()` accepts these options:
+
+- `password`: Passed to the upstream handler if it requests a password. It is held for the lifetime of the archive handle, is not logged, and is limited to 1 MiB of UTF-8 data.
 
 ### Listing and looking up entries
 
@@ -109,7 +111,12 @@ const header = await archive.read(entry.path, {
 });
 ```
 
-Offsets and lengths accept safe integers or `bigint`. A range read returns only the requested bytes and is limited to 64 MiB. It uses the handler's normal extraction path, however, so a sequential or solid format may still need to decompress preceding data or the whole entry. It is not guaranteed to be constant-time random access.
+`read()` accepts these options:
+
+- `offset`: Byte position at which to start reading. Defaults to `0`; accepts a non-negative safe integer or `bigint`.
+- `length`: Number of bytes to return. Required; accepts a non-negative safe integer or `bigint`. A range read is limited to 64 MiB.
+
+A range read returns only the requested bytes. It uses the handler's normal extraction path, however, so a sequential or solid format may still need to decompress preceding data or the whole entry. It is not guaranteed to be constant-time random access.
 
 ### Streams and output destinations
 
@@ -125,7 +132,13 @@ for await (const chunk of archive.createReadStream(entry.path, {
 }
 ```
 
-The native engine emits bounded 64 KiB chunks and waits for stream demand, preserving backpressure. Destroying the stream or aborting its signal cancels extraction at the next output boundary. Streams default to a 4 GiB output limit; set `maxBytes` to another non-negative `number` or `bigint`, or to `null` to disable the limit.
+`createReadStream()` accepts these options:
+
+- `highWaterMark`: Readable buffer threshold in bytes. Must be an integer from 1 byte to 16 MiB; defaults to Node.js's Readable default.
+- `maxBytes`: Maximum number of output bytes. Defaults to 4 GiB; accepts a non-negative `number` or `bigint`, or `null` to disable the limit.
+- `signal`: Optional `AbortSignal` that cancels extraction.
+
+The native engine emits bounded 64 KiB chunks and waits for stream demand, preserving backpressure. Destroying the stream or aborting its signal cancels extraction at the next output boundary.
 
 To pipe directly to a Node.js `Writable`:
 
@@ -137,21 +150,32 @@ await archive.extractToStream(entry.path, createWriteStream('./page.jpg'), {
 });
 ```
 
-This respects backpressure and ends the destination when extraction succeeds. A destination error, early close, or abort rejects the Promise.
+`extractToStream()` accepts the same `highWaterMark`, `maxBytes`, and `signal` options as `createReadStream()`. It respects backpressure and ends the destination when extraction succeeds. A destination error, early close, or abort rejects the Promise.
 
 ### Creating ZIP, 7z, TAR, and WIM archives
 
 ```ts
-await Archive.create('./comic.cbz', [
-	{sourcePath: './pages/cover.jpg', path: 'cover.jpg'},
-	{sourcePath: './pages/01.jpg', path: 'pages/01.jpg'},
+await Archive.create('./archive.zip', [
+	{sourcePath: './image.jpg', path: 'image.jpg'},
+	{sourcePath: './file.txt', path: 'file.txt'},
 ], {
 	compressionLevel: 5,
 	overwrite: false,
 });
 ```
 
-`Archive.create()` accepts regular source files and their desired archive-internal paths. It infers ZIP from `.zip` or `.cbz`, 7z from `.7z`, TAR from `.tar`, and WIM from `.wim`; set `format: 'zip'`, `'7z'`, `'tar'`, or `'wim'` to use another output extension. Compression level is an integer from 0 to 9, defaults to 5, and applies only to ZIP and 7z. TAR is uncompressed; WIM uses the upstream handler's default settings. Duplicate, unsafe, or conflicting internal paths are rejected. The output is first written to a temporary file beside the destination, then installed atomically; an existing file is preserved unless `overwrite: true` is specified. Archive creation runs in the bounded native worker pool and does not launch a 7-Zip executable.
+`Archive.create()` accepts regular source files and their desired archive-internal paths:
+
+- `sourcePath`: Filesystem path of the regular file to add.
+- `path`: Desired path inside the archive, using `/` separators.
+
+It also accepts these options:
+
+- `format`: Archive format. If omitted, inferred as ZIP from `.zip`, 7z from `.7z`, TAR from `.tar`, or WIM from `.wim`. Set to `'zip'`, `'7z'`, `'tar'`, or `'wim'` to use another output extension.
+- `compressionLevel`: Integer from 0 to 9; defaults to 5 and applies only to ZIP and 7z. TAR is uncompressed; WIM uses the upstream handler's default settings.
+- `overwrite`: Defaults to `false`. When `true`, an existing output file is replaced after the new archive has been written.
+
+Duplicate, unsafe, or conflicting internal paths are rejected. The output is first written to a temporary file beside the destination, then installed atomically, so an existing file is preserved if archive creation fails. Archive creation runs in the bounded native worker pool and does not launch a 7-Zip executable.
 
 ### Extracting to a folder
 
@@ -171,7 +195,18 @@ await archive.extractToFolder('./unpacked', {
 });
 ```
 
-Folder extraction accepts either `ids` or exact, original archive `paths`; omit both to extract every entry, and do not provide both together. Paths use archive-internal `/` separators. `concurrency` sets the maximum number of files extracted simultaneously by this call; it must be an integer from 1 to 128, defaults to 1, and is capped at the process-wide native worker-pool concurrency. It does not change `Archive.concurrency()`. Extraction uses bounded memory and a bounded scheduler rather than queueing one promise per entry. Its default total output limit is 4 GiB; `maxBytes: null` disables that limit. Set `onProgress` to receive the number of regular files selected and fully extracted, the bytes emitted so far across active files, the total uncompressed bytes, and the calculated percentage. It is called before extraction, as data chunks are processed, and after each file completes. `onExtract` is called once per regular file after it is fully written; with `overwrite: true`, it runs after the final replacement. Its `entry` retains the original archive metadata and `outputPath` is the final destination path. On Windows only, invalid filename characters (`< > : | ? * "`) and trailing dots/spaces in each output component are replaced with `_`; selectors and entry metadata remain unchanged. By default, existing files are not overwritten; set `overwrite: true` to replace existing regular files. Replacement is committed only after that entry has been fully extracted, using a temporary file alongside the destination so a failure does not truncate the existing file. This can temporarily require extra disk space up to the size of the entry being replaced. Symlink or non-file targets are rejected. Unsafe archive paths, path collisions, and symlinked destination components are also rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
+`extractToFolder()` accepts these options:
+
+- `ids`: Entry IDs to extract. Omit both `ids` and `paths` to extract every entry.
+- `paths`: Exact, original archive paths to extract, using `/` separators. This cannot be combined with `ids`.
+- `concurrency`: Maximum number of files this call extracts simultaneously. Must be an integer from 1 to 128; defaults to 1 and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`.
+- `overwrite`: Defaults to `false`, so existing files are not overwritten. When `true`, each existing regular file is replaced only after its entry has been fully extracted to a temporary file alongside the destination. A failure does not truncate the existing file, but replacement may temporarily require extra disk space up to the size of the entry.
+- `onProgress`: Called before extraction, as chunks are processed, and after each file completes. Receives `filesExtracted`, `totalFiles`, aggregated `bytesProcessed`, `totalBytes`, and the calculated `percent`.
+- `onExtract`: Called once for each regular file after it is fully written and, when overwriting, after the final replacement. Receives `{entry, outputPath}`; `entry` retains the original archive metadata and `outputPath` is the final destination path.
+- `maxBytes`: Maximum total uncompressed output size. Defaults to 4 GiB; set to `null` to disable the limit.
+- `signal`: Optional `AbortSignal`. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
+
+On Windows only, invalid filename characters (`< > : | ? * "`) and trailing dots/spaces in each destination component are replaced with `_`; selectors and entry metadata remain unchanged. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 
 ### Concurrency
 
@@ -181,7 +216,11 @@ Archive.concurrency(8);
 Archive.concurrency(0); // reset to the default
 ```
 
-The setting controls the process-wide native worker pool used by extraction, streams, and range reads. The default is the lesser of 4 and the parallelism available to Node.js; the allowed range is 1–128 workers, with `0` restoring the default.
+`Archive.concurrency(value?)` controls the process-wide native worker pool used by extraction, streams, and range reads:
+
+- `value`: Omit to read the current setting. Set to an integer from 1 to 128 to configure the worker count, or `0` to restore the default.
+
+The default is the lesser of 4 and the parallelism available to Node.js.
 
 Concurrent operations on one archive use independent decoder contexts rather than calling one 7-Zip archive object simultaneously. This is safe for handlers that support independent contexts, but it does not guarantee a speedup. Solid archives may decompress shared data more than once; batching related entries may be faster.
 

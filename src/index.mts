@@ -585,7 +585,7 @@ export class Archive {
 			{
 				format = '7z';
 			}
-			else if(extension === '.zip' || extension === '.cbz')
+			else if(extension === '.zip')
 			{
 				format = 'zip';
 			}

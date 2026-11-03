@@ -112,7 +112,7 @@ let encryptedZipPath = '';
 
 before(async () => {
 	directory = await mkdtemp(join(tmpdir(), '7zip-native-'));
-	archivePath = join(directory, 'fixture.cbz');
+	archivePath = join(directory, 'fixture.zip');
 	gzipPath = join(directory, 'fixture.txt.gz');
 	sevenZipArchivePath = join(directory, 'fixture.7z');
 	const protectedFilePath = join(directory, 'protected.txt');
