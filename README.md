@@ -144,12 +144,16 @@ This respects backpressure and ends the destination when extraction succeeds. A 
 ```ts
 await archive.extractToFolder('./unpacked', {
 	paths: ['chapter/page1.jpg', 'chapter/page2.jpg'], // alternatively, use ids
+	overwrite: true,
+	onProgress: ({filesExtracted, totalFiles, bytesProcessed, totalBytes, percent}) => {
+		console.log(`${filesExtracted}/${totalFiles} files, ${percent}% (${bytesProcessed}/${totalBytes} bytes)`);
+	},
 	maxBytes: 2n * 1024n * 1024n * 1024n,
 	signal: abortController.signal,
 });
 ```
 
-Folder extraction accepts either `ids` or exact `paths`; omit both to extract every entry, and do not provide both together. Paths use archive-internal `/` separators. Extraction is sequential and uses bounded memory. Its default total output limit is 4 GiB; `maxBytes: null` disables that limit. Existing files are never overwritten. Unsafe paths, path collisions, and symlinked destination components are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
+Folder extraction accepts either `ids` or exact `paths`; omit both to extract every entry, and do not provide both together. Paths use archive-internal `/` separators. Extraction is sequential and uses bounded memory. Its default total output limit is 4 GiB; `maxBytes: null` disables that limit. Set `onProgress` to receive the number of regular files selected and fully extracted, the bytes emitted so far, the total uncompressed bytes, and the calculated percentage. It is called before extraction, as data chunks are processed, and after each file completes. By default, existing files are not overwritten; set `overwrite: true` to replace existing regular files. Replacement is committed only after that entry has been fully extracted, using a temporary file alongside the destination so a failure does not truncate the existing file. This can temporarily require extra disk space up to the size of the entry being replaced. Symlink or non-file targets are rejected. Unsafe archive paths, path collisions, and symlinked destination components are also rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 
 ### Concurrency
 

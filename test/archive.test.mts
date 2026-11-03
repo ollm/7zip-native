@@ -254,6 +254,92 @@ test('extracts archive entries to a folder without overwriting existing files', 
 			archive.extractToFolder(destination),
 			(error: unknown) => error instanceof Error && (error as NodeJS.ErrnoException).code === 'EEXIST',
 		);
+		const coverPath = join(destination, 'chapter/cover.jpg');
+		await writeFile(coverPath, 'old content');
+		await archive.extractToFolder(destination, {
+			paths: ['chapter/cover.jpg'],
+			overwrite: true,
+		});
+		assert.equal((await readFile(coverPath)).toString(), 'native 7-Zip reads this image');
+	}
+	finally
+	{
+		await archive.close();
+	}
+});
+
+test('does not follow a symlink when overwriting an extracted file', async (context) => {
+	const destination = join(directory, 'overwrite-symlink-output');
+	const outsideFile = join(directory, 'overwrite-symlink-target.txt');
+	await mkdir(join(destination, 'chapter'), {recursive: true});
+	await writeFile(outsideFile, 'keep this file');
+	try
+	{
+		await symlink(outsideFile, join(destination, 'chapter/cover.jpg'));
+	}
+	catch(error)
+	{
+		context.skip(`File symlinks are unavailable: ${String(error)}`);
+		return;
+	}
+
+	const archive = await Archive.open(archivePath);
+	try
+	{
+		await assert.rejects(
+			archive.extractToFolder(destination, {
+				paths: ['chapter/cover.jpg'],
+				overwrite: true,
+			}),
+			(error: unknown) => error instanceof ArchiveError && error.code === 'ERR_ARCHIVE_PATH',
+		);
+		assert.equal((await readFile(outsideFile)).toString(), 'keep this file');
+	}
+	finally
+	{
+		await archive.close();
+	}
+});
+
+test('reports folder extraction progress by bytes and files', async () => {
+	const archive = await Archive.open(archivePath);
+	const progress: Array<{
+		filesExtracted: number;
+		totalFiles: number;
+		bytesProcessed: bigint;
+		totalBytes: bigint;
+		percent: number;
+	}> = [];
+	try
+	{
+		await archive.extractToFolder(join(directory, 'extracted-progress'), {
+			paths: ['chapter/cover.jpg', 'empty.txt'],
+			onProgress: (update) => {
+				progress.push(update);
+			},
+		});
+		assert.deepEqual(progress[0], {
+			filesExtracted: 0,
+			totalFiles: 2,
+			bytesProcessed: 0n,
+			totalBytes: 29n,
+			percent: 0,
+		});
+		assert.deepEqual(progress.find(update =>
+			update.bytesProcessed === 29n && update.filesExtracted === 0), {
+			filesExtracted: 0,
+			totalFiles: 2,
+			bytesProcessed: 29n,
+			totalBytes: 29n,
+			percent: 99,
+		});
+		assert.deepEqual(progress.at(-1), {
+			filesExtracted: 2,
+			totalFiles: 2,
+			bytesProcessed: 29n,
+			totalBytes: 29n,
+			percent: 100,
+		});
 	}
 	finally
 	{

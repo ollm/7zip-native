@@ -21,6 +21,14 @@ export interface OpenOptions {
 	readonly password?: string;
 }
 
+export interface ExtractToFolderProgress {
+	readonly filesExtracted: number;
+	readonly totalFiles: number;
+	readonly bytesProcessed: bigint;
+	readonly totalBytes: bigint;
+	readonly percent: number;
+}
+
 export interface ReadStreamOptions {
 	readonly highWaterMark?: number;
 	readonly maxBytes?: number | bigint | null;
@@ -30,6 +38,8 @@ export interface ReadStreamOptions {
 export interface ExtractToFolderOptions {
 	readonly ids?: readonly EntryId[];
 	readonly paths?: readonly string[];
+	readonly overwrite?: boolean;
+	readonly onProgress?: (progress: ExtractToFolderProgress) => void;
 	readonly maxBytes?: number | bigint | null;
 	readonly signal?: AbortSignal;
 }

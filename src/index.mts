@@ -1,5 +1,6 @@
 import {createWriteStream, existsSync} from 'node:fs';
-import {lstat, mkdir} from 'node:fs/promises';
+import {lstat, mkdir, rename, rm} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
 import {createRequire} from 'node:module';
 import {availableParallelism} from 'node:os';
 import {dirname, join, relative as relativePath, resolve, sep} from 'node:path';
@@ -23,6 +24,7 @@ export type {
 	ArchiveErrorCode,
 	EntryId,
 	EntrySelector,
+	ExtractToFolderProgress,
 	ExtractToFolderOptions,
 	OpenOptions,
 	ReadOptions,
@@ -202,6 +204,28 @@ async function ensureDirectory(directoryPath: string): Promise<void>
 	if(details.isSymbolicLink() || !details.isDirectory())
 	{
 		throw new ArchiveError('ERR_ARCHIVE_PATH', `Destination path is not a real directory: ${directoryPath}`);
+	}
+}
+
+async function assertReplaceableOutput(filePath: string): Promise<void>
+{
+	try
+	{
+		const details = await lstat(filePath);
+		if(!details.isFile())
+		{
+			throw new ArchiveError(
+				'ERR_ARCHIVE_PATH',
+				`Cannot replace a non-file extraction target: ${filePath}`,
+			);
+		}
+	}
+	catch (error)
+	{
+		if(error instanceof ArchiveError || (error as NodeJS.ErrnoException).code !== 'ENOENT')
+		{
+			throw error;
+		}
 	}
 }
 
@@ -536,6 +560,14 @@ export class Archive {
 		{
 			throw new TypeError('Folder extraction options must be an object');
 		}
+		if(options.overwrite !== undefined && typeof options.overwrite !== 'boolean')
+		{
+			throw new TypeError('Folder extraction overwrite option must be a boolean');
+		}
+		if(options.onProgress !== undefined && typeof options.onProgress !== 'function')
+		{
+			throw new TypeError('Folder extraction onProgress option must be a function');
+		}
 		options.signal?.throwIfAborted();
 		const maxBytes = normalizeMaxBytes(options.maxBytes, 'maxBytes');
 		const entries = await this.entries();
@@ -597,6 +629,28 @@ export class Archive {
 		await ensureExtractionRoot(root);
 
 		let extractedBytes = 0n;
+		let filesExtracted = 0;
+		const totalFiles = plans.filter(plan => !plan.isDirectory).length;
+		const reportProgress = (): void => {
+			let percent = 0;
+			if(expectedBytes > 0n)
+			{
+				const scaledPercent = extractedBytes * 10000n / expectedBytes;
+				percent = Number(scaledPercent > 9900n ? 9900n : scaledPercent) / 100;
+			}
+			if(filesExtracted === totalFiles)
+			{
+				percent = 100;
+			}
+			options.onProgress?.({
+				filesExtracted,
+				totalFiles,
+				bytesProcessed: extractedBytes,
+				totalBytes: expectedBytes,
+				percent,
+			});
+		};
+		reportProgress();
 		for(const plan of plans)
 		{
 			options.signal?.throwIfAborted();
@@ -606,7 +660,6 @@ export class Archive {
 				continue;
 			}
 			await ensureOutputParents(root, plan.targetPath);
-			const output = createWriteStream(plan.targetPath, {flags: 'wx', mode: 0o600});
 			const limit = new Transform({
 				transform(chunk: Buffer, _encoding, callback) {
 					const size = BigInt(chunk.length);
@@ -619,18 +672,56 @@ export class Archive {
 						return;
 					}
 					extractedBytes += size;
+					try
+					{
+						reportProgress();
+					}
+					catch (error)
+					{
+						callback(error instanceof Error ? error : new Error(String(error)));
+						return;
+					}
 					callback(null, chunk);
 				},
 			});
-			await pipeline(
-				this.createReadStream(plan.entry.id, {
-					signal: options.signal,
-					maxBytes: null,
-				}),
-				limit,
-				output,
-				{signal: options.signal},
-			);
+			if(options.overwrite)
+			{
+				await assertReplaceableOutput(plan.targetPath);
+				const temporaryPath = join(dirname(plan.targetPath), `.7zip-native-${randomUUID()}.tmp`);
+				try
+				{
+					await pipeline(
+						this.createReadStream(plan.entry.id, {
+							signal: options.signal,
+							maxBytes: null,
+						}),
+						limit,
+						createWriteStream(temporaryPath, {flags: 'wx', mode: 0o600}),
+						{signal: options.signal},
+					);
+					await assertReplaceableOutput(plan.targetPath);
+					await rename(temporaryPath, plan.targetPath);
+				}
+				catch (error)
+				{
+					await rm(temporaryPath, {force: true});
+					throw error;
+				}
+			}
+			else
+			{
+				await pipeline(
+					this.createReadStream(plan.entry.id, {
+						signal: options.signal,
+						maxBytes: null,
+					}),
+					limit,
+					createWriteStream(plan.targetPath, {flags: 'wx', mode: 0o600}),
+					{signal: options.signal},
+				);
+			}
+			filesExtracted++;
+			reportProgress();
 		}
 	}
 
