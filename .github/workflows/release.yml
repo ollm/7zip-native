@@ -73,8 +73,9 @@ jobs:
             node-arch: x64
           - target: win32-ia32
             runner: windows-2025-vs2026
+            build-arch: ia32
             msvc-arch: x86
-            node-arch: x86
+            node-arch: x64
           - target: win32-arm64
             runner: windows-11-arm
             msvc-arch: arm64
