@@ -3,6 +3,9 @@
 
 # 7zip-native
 
+### Current version `26.05`
+Upstream 7-Zip archive engine from https://github.com/ip7z/7zip/
+
 Native Node-API bindings for the 7-Zip archive engine. Use a typed, Promise-based Node.js API to inspect archives, read entry data, stream large files, or extract entries without launching `7z`, `7zz`, or another archive executable.
 
 The package includes the native addon and the matching 7-Zip engine for each supported target. Compression and decompression are provided by the upstream 7-Zip implementation.
