@@ -1,6 +1,8 @@
 import typescript from '@rollup/plugin-typescript';
 import dts from 'rollup-plugin-dts';
 
+const isNodeBuiltin = id => id.startsWith('node:');
+
 export default [
 	{
 		input: 'src/index.mts',
@@ -20,7 +22,7 @@ export default [
 				declaration: false,
 			}),
 		],
-		external: ['node:module', 'node:path'],
+		external: isNodeBuiltin,
 	},
 	{
 		input: 'src/index.mts',
@@ -30,5 +32,6 @@ export default [
 			{file: 'dist/index.d.cts', format: 'es'},
 		],
 		plugins: [dts()],
+		external: isNodeBuiltin,
 	},
 ];

@@ -16,7 +16,32 @@ permissions:
   contents: read
 
 jobs:
+  validate-release:
+    name: Validate release tag
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Require a tag matching the package version
+        run: |
+          node --input-type=module -e '
+            import {readFileSync} from "node:fs";
+            const version = JSON.parse(readFileSync("package.json", "utf8")).version;
+            if (process.env.GITHUB_REF_NAME !== `v${version}`) {
+              throw new Error(`Tag v${version} is required; found ${process.env.GITHUB_REF_NAME}`);
+            }
+          '
+
   build:
+    needs: validate-release
+    if: >-
+      !cancelled() &&
+      (needs.validate-release.result == 'success' || needs.validate-release.result == 'skipped')
     name: ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -105,7 +130,7 @@ jobs:
 
   publish:
     name: Publish package to npm
-    needs: build
+    needs: [build, validate-release]
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.publish)
@@ -145,7 +170,10 @@ jobs:
               throw new Error(`Tag v${version} is required; found ${process.env.GITHUB_REF_NAME}`);
             }
             for (const target of ["linux-x64", "linux-ia32", "linux-arm", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-ia32", "win32-arm64"]) {
-              for (const file of ["7zip_native.node", target.startsWith("win32-") ? "7z.dll" : "7z.so"]) {
+              const engine = target.startsWith("win32-")
+                ? "7z.dll"
+                : target.startsWith("darwin-") ? "lib7z.dylib" : "7z.so";
+              for (const file of ["7zip_native.node", engine]) {
                 readFileSync(`prebuilds/${target}/${file}`);
               }
             }
