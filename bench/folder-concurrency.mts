@@ -3,9 +3,11 @@ import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {Archive, type ExtractToFolderProgress} from '../dist/index.mjs';
 
-const usage = 'npm run benchmark:folder-concurrency -- --archive <path> [--archive <path> ...] [--iterations <count>]';
+const usage = 'npm run benchmark:folder-concurrency -- --archive <path> [--archive <path> ...] [--iterations <count>] [--concurrency <workers> | --concurrencies <workers,...>]';
 const archivePaths: string[] = [];
 let iterations = 1;
+let concurrencyOption: string | undefined;
+let concurrenciesOption: string | undefined;
 const args = process.argv.slice(2);
 for(let index = 0; index < args.length; index++)
 {
@@ -32,6 +34,34 @@ for(let index = 0; index < args.length; index++)
 		iterations = Number(value);
 		continue;
 	}
+	if(argument === '--concurrency' || argument.startsWith('--concurrency='))
+	{
+		if(concurrencyOption !== undefined)
+		{
+			throw new TypeError('Option --concurrency may only be specified once');
+		}
+		const equalsIndex = argument.indexOf('=');
+		concurrencyOption = equalsIndex === -1 ? args[++index] : argument.slice(equalsIndex + 1);
+		if(!concurrencyOption || concurrencyOption.startsWith('--'))
+		{
+			throw new TypeError(`Missing value for --concurrency\nUsage: ${usage}`);
+		}
+		continue;
+	}
+	if(argument === '--concurrencies' || argument.startsWith('--concurrencies='))
+	{
+		if(concurrenciesOption !== undefined)
+		{
+			throw new TypeError('Option --concurrencies may only be specified once');
+		}
+		const equalsIndex = argument.indexOf('=');
+		concurrenciesOption = equalsIndex === -1 ? args[++index] : argument.slice(equalsIndex + 1);
+		if(!concurrenciesOption || concurrenciesOption.startsWith('--'))
+		{
+			throw new TypeError(`Missing value for --concurrencies\nUsage: ${usage}`);
+		}
+		continue;
+	}
 	throw new TypeError(`Unknown argument ${argument}\nUsage: ${usage}`);
 }
 
@@ -43,8 +73,27 @@ if(!Number.isSafeInteger(iterations) || iterations < 1)
 {
 	throw new RangeError('--iterations must be a positive integer');
 }
+if(concurrencyOption !== undefined && concurrenciesOption !== undefined)
+{
+	throw new TypeError('Use either --concurrency or --concurrencies, not both');
+}
 
-const concurrencies = Array.from({length: 16}, (_, index) => index + 1);
+function parseConcurrency(value: string): number
+{
+	const concurrency = Number(value);
+	if(!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 16)
+	{
+		throw new RangeError('Concurrency values must be integers between 1 and 16');
+	}
+	return concurrency;
+}
+
+const selectedConcurrencies = concurrencyOption === undefined
+	? concurrenciesOption === undefined
+		? Array.from({length: 16}, (_, index) => index + 1)
+		: concurrenciesOption.split(',').map(value => parseConcurrency(value.trim()))
+	: [parseConcurrency(concurrencyOption)];
+const concurrencies = [...new Set([1, ...selectedConcurrencies])];
 const originalConcurrency = Archive.concurrency();
 const archiveResults = [];
 try

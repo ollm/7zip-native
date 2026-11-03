@@ -321,10 +321,11 @@ Compare `extractToFolder()` concurrency (1 through 16) across one or more archiv
 npm run benchmark:folder-concurrency -- \
 	--archive "./samples/sample.zip" \
 	--archive "./archive.7z" \
+	--concurrencies 1,2,3,4,5,8,16 \
 	--iterations 1
 ```
 
-Each run extracts one archive into a temporary directory, verifies the completed file and byte counts, and removes the output before continuing. The default is one iteration per concurrency; increase `--iterations` for more stable measurements. The global worker pool is set to 16 for the benchmark and restored afterward.
+By default, the benchmark tests all concurrencies from 1 to 16. Use `--concurrencies` to select a comma-separated subset, or `--concurrency` for one value; concurrency 1 is always included as the speedup baseline. Each run extracts one archive into a temporary directory, verifies the completed file and byte counts, and removes the output before continuing. The default is one iteration per concurrency; increase `--iterations` for more stable measurements. The global worker pool is set to 16 for the benchmark and restored afterward.
 
 ## License
 
