@@ -787,6 +787,13 @@ export class Archive {
 		{
 			throw new TypeError('Folder extraction overwrite option must be a boolean');
 		}
+		if(options.concurrency !== undefined
+			&& (!Number.isSafeInteger(options.concurrency)
+				|| options.concurrency < 1
+				|| options.concurrency > 128))
+		{
+			throw new RangeError('Folder extraction concurrency must be an integer between 1 and 128');
+		}
 		if(options.onProgress !== undefined && typeof options.onProgress !== 'function')
 		{
 			throw new TypeError('Folder extraction onProgress option must be a function');
@@ -795,6 +802,7 @@ export class Archive {
 		{
 			throw new TypeError('Folder extraction onExtract option must be a function');
 		}
+		const concurrency = Math.min(options.concurrency ?? 1, Archive.concurrency());
 		options.signal?.throwIfAborted();
 		const maxBytes = normalizeMaxBytes(options.maxBytes, 'maxBytes');
 		const entries = await this.entries();
@@ -884,8 +892,32 @@ export class Archive {
 			if(plan.isDirectory)
 			{
 				await ensureOutputDirectoryTree(root, plan.targetPath);
-				continue;
 			}
+		}
+
+		const filePlans = plans.filter(plan => !plan.isDirectory);
+		const controller = new AbortController();
+		const extractionSignal = controller.signal;
+		let hasFailure = false;
+		let failure: unknown;
+		let nextFileIndex = 0;
+		const stop = (error: unknown): void => {
+			if(!hasFailure)
+			{
+				hasFailure = true;
+				failure = error;
+			}
+			if(!extractionSignal.aborted)
+			{
+				controller.abort(error);
+			}
+		};
+		const abortFromCaller = (): void => {
+			stop(options.signal?.reason);
+		};
+		options.signal?.addEventListener('abort', abortFromCaller, {once: true});
+
+		const extractFile = async(plan: OutputPlan): Promise<void> => {
 			await ensureOutputParents(root, plan.targetPath);
 			const limit = new Transform({
 				transform(chunk: Buffer, _encoding, callback) {
@@ -919,14 +951,16 @@ export class Archive {
 				{
 					await pipeline(
 						this.createReadStream(plan.entry.id, {
-							signal: options.signal,
+							signal: extractionSignal,
 							maxBytes: null,
 						}),
 						limit,
 						createWriteStream(temporaryPath, {flags: 'wx', mode: 0o600}),
-						{signal: options.signal},
+						{signal: extractionSignal},
 					);
+					extractionSignal.throwIfAborted();
 					await assertReplaceableOutput(plan.targetPath);
+					extractionSignal.throwIfAborted();
 					await rename(temporaryPath, plan.targetPath);
 				}
 				catch (error)
@@ -939,17 +973,60 @@ export class Archive {
 			{
 				await pipeline(
 					this.createReadStream(plan.entry.id, {
-						signal: options.signal,
+						signal: extractionSignal,
 						maxBytes: null,
 					}),
 					limit,
 					createWriteStream(plan.targetPath, {flags: 'wx', mode: 0o600}),
-					{signal: options.signal},
+					{signal: extractionSignal},
 				);
 			}
 			filesExtracted++;
 			reportProgress();
 			options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
+		};
+
+		const runWorker = async(): Promise<void> => {
+			while(!hasFailure)
+			{
+				if(options.signal?.aborted)
+				{
+					stop(options.signal.reason);
+					return;
+				}
+				const plan = filePlans[nextFileIndex++];
+				if(!plan)
+				{
+					return;
+				}
+				try
+				{
+					await extractFile(plan);
+				}
+				catch (error)
+				{
+					stop(error);
+					return;
+				}
+			}
+		};
+
+		try
+		{
+			options.signal?.throwIfAborted();
+			const workers = Array.from(
+				{length: Math.min(concurrency, filePlans.length)},
+				() => runWorker(),
+			);
+			await Promise.all(workers);
+			if(hasFailure)
+			{
+				throw failure;
+			}
+		}
+		finally
+		{
+			options.signal?.removeEventListener('abort', abortFromCaller);
 		}
 	}
 

@@ -56,6 +56,7 @@ export interface ReadStreamOptions {
 export interface ExtractToFolderOptions {
 	readonly ids?: readonly EntryId[];
 	readonly paths?: readonly string[];
+	readonly concurrency?: number;
 	readonly overwrite?: boolean;
 	readonly onProgress?: (progress: ExtractToFolderProgress) => void;
 	readonly onExtract?: (result: ExtractedArchiveFile) => void;

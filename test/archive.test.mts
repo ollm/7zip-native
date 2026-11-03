@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {readFileSync} from 'node:fs';
-import {mkdir, mkdtemp, readFile, rm, symlink, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile} from 'node:fs/promises';
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {Writable} from 'node:stream';
+import {Readable, Writable} from 'node:stream';
 import {after, before, test} from 'node:test';
+import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
 import {fileURLToPath} from 'node:url';
 import {gzipSync} from 'node:zlib';
@@ -563,6 +564,251 @@ test('reports folder extraction progress by bytes and files', async () => {
 	}
 	finally
 	{
+		await archive.close();
+	}
+});
+
+test('bounds folder extraction concurrency and reports completion out of order', async () => {
+	const localArchivePath = join(directory, 'concurrent-folder.zip');
+	const destination = join(directory, 'concurrent-folder-output');
+	const defaultDestination = join(directory, 'default-concurrent-folder-output');
+	const cappedDestination = join(directory, 'concurrent-folder-capped-output');
+	await writeFile(localArchivePath, makeStoredZip([
+		{name: 'slow.txt', data: 'abcdef'},
+		{name: 'fast.txt', data: 'wxyz'},
+		{name: 'middle.txt', data: '123'},
+	]));
+	const archive = await Archive.open(localArchivePath);
+	const entries = await archive.entries();
+	const entriesById = new Map(entries.map(entry => [entry.id, entry]));
+	const previousConcurrency = Archive.concurrency();
+	let active = 0;
+	let maximumActive = 0;
+	const completions: string[] = [];
+	const progress: Array<{filesExtracted: number; bytesProcessed: bigint}> = [];
+	try
+	{
+		Archive.concurrency(4);
+		archive.createReadStream = (id, options) => Readable.from((async function*() {
+			if(typeof id !== 'number')
+			{
+				throw new TypeError('Expected an entry ID');
+			}
+			const entry = entriesById.get(id);
+			assert.ok(entry);
+			active++;
+			maximumActive = Math.max(maximumActive, active);
+			try
+			{
+				if(entry.path === 'slow.txt')
+				{
+					await delay(5, undefined, {signal: options?.signal});
+					yield Buffer.from('abc');
+					await delay(40, undefined, {signal: options?.signal});
+					yield Buffer.from('def');
+				}
+				else if(entry.path === 'fast.txt')
+				{
+					await delay(10, undefined, {signal: options?.signal});
+					yield Buffer.from('wxyz');
+				}
+				else
+				{
+					await delay(5, undefined, {signal: options?.signal});
+					yield Buffer.from('123');
+				}
+			}
+			finally
+			{
+				active--;
+			}
+		})());
+
+		await archive.extractToFolder(destination, {
+			concurrency: 2,
+			onProgress: update => progress.push({
+				filesExtracted: update.filesExtracted,
+				bytesProcessed: update.bytesProcessed,
+			}),
+			onExtract: ({entry}) => completions.push(entry.path),
+		});
+		assert.equal(maximumActive, 2);
+		assert.equal(active, 0);
+		assert.deepEqual(completions, ['fast.txt', 'middle.txt', 'slow.txt']);
+		assert.ok(progress.some(update => update.filesExtracted === 1 && update.bytesProcessed === 7n));
+		assert.deepEqual(progress.at(-1), {filesExtracted: 3, bytesProcessed: 13n});
+		assert.equal(Archive.concurrency(), 4);
+		assert.deepEqual(await readFile(join(destination, 'slow.txt')), Buffer.from('abcdef'));
+		assert.deepEqual(await readFile(join(destination, 'fast.txt')), Buffer.from('wxyz'));
+		assert.deepEqual(await readFile(join(destination, 'middle.txt')), Buffer.from('123'));
+
+		active = 0;
+		maximumActive = 0;
+		await archive.extractToFolder(defaultDestination);
+		assert.equal(maximumActive, 1);
+		assert.equal(Archive.concurrency(), 4);
+
+		active = 0;
+		maximumActive = 0;
+		Archive.concurrency(1);
+		await archive.extractToFolder(cappedDestination, {concurrency: 8});
+		assert.equal(maximumActive, 1);
+		assert.equal(Archive.concurrency(), 1);
+
+		for(const concurrency of [0, 1.5, 129])
+		{
+			await assert.rejects(
+				archive.extractToFolder(join(directory, `invalid-concurrency-${concurrency}`), {concurrency}),
+				RangeError,
+			);
+		}
+	}
+	finally
+	{
+		Archive.concurrency(previousConcurrency);
+		await archive.close();
+	}
+});
+
+test('stops scheduling on extraction failure and removes overwrite temporaries', async () => {
+	const localArchivePath = join(directory, 'failed-concurrent-folder.zip');
+	const destination = join(directory, 'failed-concurrent-folder-output');
+	await writeFile(localArchivePath, makeStoredZip([
+		{name: 'fail.txt', data: 'fail'},
+		{name: 'active.txt', data: 'active'},
+		{name: 'queued.txt', data: 'queued'},
+	]));
+	await mkdir(destination);
+	for(const name of ['fail.txt', 'active.txt', 'queued.txt'])
+	{
+		await writeFile(join(destination, name), `old ${name}`);
+	}
+	const archive = await Archive.open(localArchivePath);
+	const entriesById = new Map((await archive.entries()).map(entry => [entry.id, entry]));
+	const previousConcurrency = Archive.concurrency();
+	let active = 0;
+	let started = 0;
+	try
+	{
+		Archive.concurrency(4);
+		archive.createReadStream = (id, options) => Readable.from((async function*() {
+			if(typeof id !== 'number')
+			{
+				throw new TypeError('Expected an entry ID');
+			}
+			const entry = entriesById.get(id);
+			assert.ok(entry);
+			active++;
+			started++;
+			try
+			{
+				if(entry.path === 'fail.txt')
+				{
+					await delay(10, undefined, {signal: options?.signal});
+					throw new Error('injected extraction failure');
+				}
+				await delay(1000, undefined, {signal: options?.signal});
+				yield Buffer.from(entry.path);
+			}
+			finally
+			{
+				active--;
+			}
+		})());
+
+		await assert.rejects(
+			archive.extractToFolder(destination, {concurrency: 2, overwrite: true}),
+			/injected extraction failure/,
+		);
+		assert.equal(started, 2);
+		assert.equal(active, 0);
+		assert.deepEqual((await readdir(destination)).sort(), ['active.txt', 'fail.txt', 'queued.txt']);
+		for(const name of ['fail.txt', 'active.txt', 'queued.txt'])
+		{
+			assert.equal((await readFile(join(destination, name))).toString(), `old ${name}`);
+		}
+	}
+	finally
+	{
+		Archive.concurrency(previousConcurrency);
+		await archive.close();
+	}
+});
+
+test('cancels active folder extractions before rejecting and removes overwrite temporaries', async () => {
+	const localArchivePath = join(directory, 'cancelled-concurrent-folder.zip');
+	const destination = join(directory, 'cancelled-concurrent-folder-output');
+	await writeFile(localArchivePath, makeStoredZip([
+		{name: 'first.txt', data: 'first'},
+		{name: 'second.txt', data: 'second'},
+		{name: 'queued.txt', data: 'queued'},
+	]));
+	await mkdir(destination);
+	for(const name of ['first.txt', 'second.txt', 'queued.txt'])
+	{
+		await writeFile(join(destination, name), `old ${name}`);
+	}
+	const archive = await Archive.open(localArchivePath);
+	const entriesById = new Map((await archive.entries()).map(entry => [entry.id, entry]));
+	const previousConcurrency = Archive.concurrency();
+	const controller = new AbortController();
+	let active = 0;
+	let started = 0;
+	let resolveTwoStarted!: () => void;
+	const twoStarted = new Promise<void>((resolve) => {
+		resolveTwoStarted = resolve;
+	});
+	try
+	{
+		Archive.concurrency(4);
+		archive.createReadStream = (id, options) => Readable.from((async function*() {
+			if(typeof id !== 'number')
+			{
+				throw new TypeError('Expected an entry ID');
+			}
+			const entry = entriesById.get(id);
+			assert.ok(entry);
+			active++;
+			started++;
+			if(started === 2)
+			{
+				resolveTwoStarted();
+			}
+			try
+			{
+				await delay(1000, undefined, {signal: options?.signal});
+				yield Buffer.from(entry.path);
+			}
+			finally
+			{
+				active--;
+			}
+		})());
+
+		const extraction = archive.extractToFolder(destination, {
+			concurrency: 2,
+			overwrite: true,
+			signal: controller.signal,
+		});
+		await Promise.race([
+			twoStarted,
+			delay(1000).then(() => {
+				throw new Error('Timed out waiting for concurrent extractions to start');
+			}),
+		]);
+		controller.abort();
+		await assert.rejects(extraction);
+		assert.equal(started, 2);
+		assert.equal(active, 0);
+		assert.deepEqual((await readdir(destination)).sort(), ['first.txt', 'queued.txt', 'second.txt']);
+		for(const name of ['first.txt', 'second.txt', 'queued.txt'])
+		{
+			assert.equal((await readFile(join(destination, name))).toString(), `old ${name}`);
+		}
+	}
+	finally
+	{
+		Archive.concurrency(previousConcurrency);
 		await archive.close();
 	}
 });
