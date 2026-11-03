@@ -60,12 +60,12 @@ else
 		args.push(
 			`CC=${compilerPrefix}gcc`,
 			`CXX=${compilerPrefix}g++`,
-			'MY_ARCH=-march=armv7-a -mfloat-abi=hard',
+			'MY_ARCH=-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard',
 		);
 		buildEnv.CC = `${compilerPrefix}gcc`;
 		buildEnv.CXX = `${compilerPrefix}g++`;
-		buildEnv.CXXFLAGS = `${buildEnv.CXXFLAGS ?? ''} -march=armv7-a -mfloat-abi=hard`.trim();
-		buildEnv.LDFLAGS = `${buildEnv.LDFLAGS ?? ''} -march=armv7-a -mfloat-abi=hard`.trim();
+		buildEnv.CXXFLAGS = `${buildEnv.CXXFLAGS ?? ''} -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard`.trim();
+		buildEnv.LDFLAGS = `${buildEnv.LDFLAGS ?? ''} -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard`.trim();
 	}
 	if(process.platform === 'darwin')
 	{
@@ -101,8 +101,8 @@ if(targetArch !== process.arch)
 	{
 		nodeGypEnv.CC = 'arm-linux-gnueabihf-gcc';
 		nodeGypEnv.CXX = 'arm-linux-gnueabihf-g++';
-		nodeGypEnv.CXXFLAGS = `${nodeGypEnv.CXXFLAGS ?? ''} -march=armv7-a -mfloat-abi=hard`.trim();
-		nodeGypEnv.LDFLAGS = `${nodeGypEnv.LDFLAGS ?? ''} -march=armv7-a -mfloat-abi=hard`.trim();
+		nodeGypEnv.CXXFLAGS = `${nodeGypEnv.CXXFLAGS ?? ''} -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard`.trim();
+		nodeGypEnv.LDFLAGS = `${nodeGypEnv.LDFLAGS ?? ''} -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard`.trim();
 	}
 }
 await run(process.execPath, nodeGypArgs, root, nodeGypEnv);

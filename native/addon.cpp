@@ -1366,6 +1366,7 @@ private:
 			Entry entry;
 			entry.id = i;
 			entry.path = GetPropString(archive, i, kpidPath);
+			std::replace(entry.path.begin(), entry.path.end(), '\\', '/');
 			entry.size = GetPropUInt64(archive, i, kpidSize);
 			entry.compressedSize = GetPropUInt64(archive, i, kpidPackSize);
 			entry.attributes = static_cast<std::uint32_t>(GetPropUInt64(archive, i, kpidAttrib));
