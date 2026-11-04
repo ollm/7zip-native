@@ -46,6 +46,8 @@ else
 		'-f',
 		'makefile.gcc',
 		`-j${process.env.BUILD_JOBS ?? Math.min(availableParallelism(), 2)}`,
+		// Avoid 2 MiB aligned allocations that Electron's allocator traps on.
+		'CFLAGS_BASE2=-DZ7_NO_MADVISE',
 	];
 	const buildEnv = {...process.env};
 	if(targetArch === 'ia32')

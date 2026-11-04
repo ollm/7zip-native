@@ -1752,7 +1752,7 @@ Napi::Buffer<std::uint8_t> TakeBuffer(Napi::Env env, std::vector<std::uint8_t> d
 		return Napi::Buffer<std::uint8_t>::New(env, 0);
 	}
 	auto *owned = new std::vector<std::uint8_t>(std::move(data));
-	return Napi::Buffer<std::uint8_t>::New(
+	return Napi::Buffer<std::uint8_t>::NewOrCopy(
 		env,
 		owned->data(),
 		owned->size(),
