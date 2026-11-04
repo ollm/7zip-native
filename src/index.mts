@@ -86,13 +86,17 @@ interface NativeBinding {
 	create(
 		outputPath: string,
 		format: ArchiveFormat,
-		entries: readonly ArchiveCreateEntry[],
+		entries: readonly NativeCreateEntry[],
 		compressionLevel: number,
 		enginePath: string,
 	): Promise<void>;
 }
 
 type NativeEntry = ArchiveEntry;
+
+interface NativeCreateEntry extends ArchiveCreateEntry {
+	readonly mtimeMs: number;
+}
 
 const require = createRequire(import.meta.url);
 let engineName = '7z.so';
@@ -288,7 +292,7 @@ async function assertOutputDoesNotExist(filePath: string): Promise<void>
 	}
 }
 
-async function normalizeCreateEntry(entry: ArchiveCreateEntry): Promise<ArchiveCreateEntry>
+async function normalizeCreateEntry(entry: ArchiveCreateEntry): Promise<NativeCreateEntry>
 {
 	if(entry === null || typeof entry !== 'object'
 		|| typeof entry.sourcePath !== 'string' || entry.sourcePath.length === 0
@@ -318,7 +322,7 @@ async function normalizeCreateEntry(entry: ArchiveCreateEntry): Promise<ArchiveC
 			`Archive creation source is not a regular file: ${sourcePath}`,
 		);
 	}
-	return {sourcePath, path: internalPath};
+	return {sourcePath, path: internalPath, mtimeMs: details.mtimeMs};
 }
 
 async function ensureExtractionRoot(root: string): Promise<void>

@@ -169,6 +169,8 @@ await Archive.create('./archive.zip', [
 - `sourcePath`: Filesystem path of the regular file to add.
 - `path`: Desired path inside the archive, using `/` separators.
 
+The source file's modification time is stored in the archive.
+
 It also accepts these options:
 
 - `format`: Archive format. If omitted, inferred as ZIP from `.zip`, 7z from `.7z`, TAR from `.tar`, or WIM from `.wim`. Set to `'zip'`, `'7z'`, `'tar'`, or `'wim'` to use another output extension.

@@ -489,7 +489,25 @@ struct Entry {
 struct ArchiveCreateItem {
 	std::string sourcePath;
 	std::string path;
+	double mtimeMs = 0;
 };
+
+FILETIME UnixMillisecondsToFileTime(double milliseconds)
+{
+	constexpr long double windowsEpochOffsetMs = 11644473600000.0L;
+	constexpr long double ticksPerMillisecond = 10000.0L;
+	const long double ticks =
+		(static_cast<long double>(milliseconds) + windowsEpochOffsetMs) * ticksPerMillisecond;
+	if (!std::isfinite(milliseconds) || ticks < 0
+		|| ticks > static_cast<long double>(std::numeric_limits<UInt64>::max())) {
+		throw std::out_of_range("Source file modification time is outside the FILETIME range");
+	}
+	const auto value = static_cast<UInt64>(ticks);
+	FILETIME fileTime{};
+	fileTime.dwLowDateTime = static_cast<DWORD>(value);
+	fileTime.dwHighDateTime = static_cast<DWORD>(value >> 32);
+	return fileTime;
+}
 
 std::uint64_t GetPropUInt64(IInArchive *archive, std::uint32_t index, PROPID propId)
 {
@@ -891,6 +909,8 @@ Z7_COM7F_IMF(ArchiveUpdateCallback::GetProperty(
 			property = path.c_str();
 		} else if (propertyId == kpidIsDir) {
 			property = false;
+		} else if (propertyId == kpidMTime) {
+			property = UnixMillisecondsToFileTime(item.mtimeMs);
 		} else if (propertyId == kpidSize) {
 			std::error_code error;
 			const auto size = std::filesystem::file_size(NativePath(item.sourcePath), error);
@@ -2300,13 +2320,19 @@ Napi::Value CreateArchive(const Napi::CallbackInfo& info)
 		const auto item = value.As<Napi::Object>();
 		const auto sourcePath = item.Get("sourcePath");
 		const auto archivePath = item.Get("path");
-		if (!sourcePath.IsString() || !archivePath.IsString()) {
+		const auto mtimeMs = item.Get("mtimeMs");
+		if (!sourcePath.IsString() || !archivePath.IsString() || !mtimeMs.IsNumber()) {
 			throw Napi::TypeError::New(
-				env, "Archive creation entries require string sourcePath and path values");
+				env, "Archive creation entries require string sourcePath, path, and numeric mtimeMs values");
+		}
+		const double sourceMtimeMs = mtimeMs.As<Napi::Number>().DoubleValue();
+		if (!std::isfinite(sourceMtimeMs)) {
+			throw Napi::TypeError::New(env, "Archive creation entry mtimeMs must be finite");
 		}
 		entries.push_back({
 			sourcePath.As<Napi::String>().Utf8Value(),
 			archivePath.As<Napi::String>().Utf8Value(),
+			sourceMtimeMs,
 		});
 	}
 	if (!ReserveOperation()) {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {readFileSync} from 'node:fs';
-import {copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile} from 'node:fs/promises';
+import {copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile} from 'node:fs/promises';
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -230,6 +230,22 @@ test('creates archives atomically, enforces overwrite, and validates entry paths
 		Archive.create(join(directory, 'compressed.tar'), [entry], {compressionLevel: 1}),
 		TypeError,
 	);
+});
+
+test('preserves source modification times in 7z archives', async () => {
+	const sourcePath = join(directory, 'timestamp-source.txt');
+	const outputPath = join(directory, 'timestamp-preserved.7z');
+	const modified = new Date('2020-04-05T06:07:08.000Z');
+	await writeFile(sourcePath, 'timestamp test');
+	await utimes(sourcePath, modified, modified);
+	await Archive.create(outputPath, [{sourcePath, path: 'timestamp-source.txt'}], {
+		format: '7z',
+	});
+
+	const {stdout} = await execFileAsync(sevenZip.path7z, ['l', '-slt', outputPath], {
+		env: {...process.env, TZ: 'UTC'},
+	});
+	assert.match(stdout, /Modified = 2020-04-05 06:07:08/);
 });
 
 test('opens, indexes, partially reads, and extracts ZIP entries', async () => {
