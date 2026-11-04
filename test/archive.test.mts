@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {readFileSync} from 'node:fs';
-import {mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile} from 'node:fs/promises';
+import {copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile} from 'node:fs/promises';
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -9,7 +9,7 @@ import {Readable, Writable} from 'node:stream';
 import {after, before, test} from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 import {gzipSync} from 'node:zlib';
 import {Archive, ArchiveError, type ArchiveEntry} from '../dist/index.mjs';
 
@@ -17,6 +17,7 @@ const execFileAsync = promisify(execFile);
 const sevenZip = createRequire(import.meta.url)('7zip-bin-full') as {path7z: string};
 const testPassword = 'correct-horse';
 const sampleDirectory = fileURLToPath(new URL('../samples/', import.meta.url));
+const sourcePackageDirectory = fileURLToPath(new URL('../', import.meta.url));
 const sampleArchives = ['sample.7z', 'sample.rar', 'sample.tar', 'sample.wim', 'sample.zip'] as const;
 const sampleAssetPaths = [
 	'sample/noise.avif',
@@ -109,6 +110,35 @@ let archivePath = '';
 let gzipPath = '';
 let sevenZipArchivePath = '';
 let encryptedZipPath = '';
+
+test('resolves native binaries from the installed package when the entry point is relocated', async (context) => {
+	const fixtureDirectory = await mkdtemp(join(tmpdir(), '7zip-native-relocated-'));
+	const bundleDirectory = join(fixtureDirectory, 'app/www/dist');
+	const nodeModulesDirectory = join(fixtureDirectory, 'app/node_modules');
+	const relocatedEntryPath = join(bundleDirectory, 'index.mjs');
+	await mkdir(bundleDirectory, {recursive: true});
+	await mkdir(nodeModulesDirectory, {recursive: true});
+	try
+	{
+		await symlink(sourcePackageDirectory, join(nodeModulesDirectory, '7zip-native'), 'dir');
+		await copyFile(fileURLToPath(new URL('../dist/index.mjs', import.meta.url)), relocatedEntryPath);
+		const relocatedModule = await import(pathToFileURL(relocatedEntryPath).href);
+		assert.equal(typeof relocatedModule.Archive, 'function');
+	}
+	catch(error)
+	{
+		if(error instanceof Error && 'code' in error && error.code === 'EPERM')
+		{
+			context.skip(`Package symlinks are unavailable: ${error.message}`);
+			return;
+		}
+		throw error;
+	}
+	finally
+	{
+		await rm(fixtureDirectory, {recursive: true, force: true});
+	}
+});
 
 before(async () => {
 	directory = await mkdtemp(join(tmpdir(), '7zip-native-'));

@@ -1,6 +1,6 @@
 {
 	"name": "7zip-native",
-	"version": "0.0.7",
+	"version": "0.0.8",
 	"description": "Native 7zip bindings for Node.js",
 	"main": "./dist/index.cjs",
 	"type": "module",
@@ -50,7 +50,7 @@
 	},
 	"scripts": {
 		"install": "node scripts/verify-prebuild.mjs",
-		"prepare": "npm run build && node scripts/clean-upstream-build.mjs",
+		"prepare": "npm run build",
 		"build": "npm run build:native && npm run eslint && npx rollup -c && npm run typecheck",
 		"build:native": "node scripts/build-native.mjs",
 		"eslint": "eslint ./src --ext .ts,.mts,.js,.mjs",

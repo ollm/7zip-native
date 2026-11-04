@@ -295,7 +295,7 @@ When packaging with ASAR, ensure both `7zip_native.node` and the matching engine
 }
 ```
 
-Test the packaged application on each target; ASAR unpacking does not replace checking that the addon and engine can both be loaded from the packaged runtime.
+If an application bundler relocates this package's JavaScript (for example, into a `www` directory), keep `7zip-native` resolvable as an installed dependency so the loader can locate the package's prebuilt binaries. Test the packaged application on each target; ASAR unpacking does not replace checking that the addon and engine can both be loaded from the packaged runtime.
 
 ## Build from source
 

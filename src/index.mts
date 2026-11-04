@@ -6,7 +6,6 @@ import {availableParallelism} from 'node:os';
 import {dirname, extname, join, relative as relativePath, resolve, sep} from 'node:path';
 import {Readable, Transform, type Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
-import {fileURLToPath} from 'node:url';
 import {
 	ArchiveError,
 	type ArchiveEntry,
@@ -105,7 +104,7 @@ else if(process.platform === 'darwin')
 {
 	engineName = 'lib7z.dylib';
 }
-const packageDirectory = dirname(fileURLToPath(import.meta.url));
+const packageDirectory = dirname(require.resolve('7zip-native'));
 const runtimeDirectory = [
 	resolve(packageDirectory, `../prebuilds/${process.platform}-${process.arch}`),
 	resolve(packageDirectory, '../build/Release'),
