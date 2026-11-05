@@ -17,6 +17,7 @@ import {
 	type ExtractToFolderOptions,
 	type OpenOptions,
 	type ReadOptions,
+	type ReadRequest,
 	type ReadStreamOptions,
 } from './types.mjs';
 
@@ -34,6 +35,7 @@ export type {
 	ExtractToFolderOptions,
 	OpenOptions,
 	ReadOptions,
+	ReadRequest,
 	ReadStreamOptions,
 } from './types.mjs';
 
@@ -77,6 +79,10 @@ interface NativeBinding {
 	open(path: string, password: string | undefined, enginePath: string): Promise<bigint>;
 	entries(handle: bigint): Promise<NativeEntry[]>;
 	extract(handle: bigint, ids: readonly number[]): Promise<Buffer[]>;
+	readMany(
+		handle: bigint,
+		requests: readonly {id: number; offset: bigint; length: bigint}[],
+	): Promise<Buffer[]>;
 	startStream(handle: bigint, id: number, callback: NativeStreamCallback): bigint;
 	resumeStream(streamId: bigint): void;
 	cancelStream(streamId: bigint): void;
@@ -1033,8 +1039,93 @@ export class Archive {
 		}
 	}
 
-	async read(idOrPath: EntrySelector, options: ReadOptions): Promise<Buffer> {
+	async read(idOrPath: EntrySelector, options: ReadOptions): Promise<Buffer>;
+	async read(idsOrPaths: readonly EntrySelector[], options: ReadOptions): Promise<Buffer[]>;
+	async read(requests: readonly ReadRequest[]): Promise<Buffer[]>;
+	async read(
+		idOrPathOrPaths: EntrySelector | readonly EntrySelector[] | readonly ReadRequest[],
+		options?: ReadOptions,
+	): Promise<Buffer | Buffer[]> {
 		this.assertOpen();
+		const maxUInt64 = (1n << 64n) - 1n;
+		const normalizeRange = (range: ReadOptions): {offset: bigint; length: bigint} => {
+			const offset = this.toUnsignedBigInt(range.offset ?? 0, 'offset');
+			const length = this.toUnsignedBigInt(range.length, 'length');
+			if(offset > maxUInt64 || length > maxUInt64 - offset)
+			{
+				throw new ArchiveError('ERR_INVALID_RANGE', 'Read range exceeds the native 64-bit offset limit');
+			}
+			return {offset, length};
+		};
+
+		if(options === undefined)
+		{
+			if(!Array.isArray(idOrPathOrPaths))
+			{
+				throw new TypeError('Read options are required for an entry selector');
+			}
+			const requests = idOrPathOrPaths as readonly ReadRequest[];
+			const normalized = await Promise.all(requests.map(async(request) => {
+				if(!request || typeof request !== 'object' || !('entry' in request))
+				{
+					throw new TypeError('Batch read requests must include an entry selector');
+				}
+				const range = normalizeRange(request);
+				return {
+					id: await this.resolveEntryId(request.entry),
+					...range,
+				};
+			}));
+			if(!normalized.length)
+			{
+				return [];
+			}
+			try
+			{
+				return await native.readMany(this.handle, normalized);
+			}
+			catch (cause)
+			{
+				throw extractionError(cause);
+			}
+		}
+
+		const isBatch = Array.isArray(idOrPathOrPaths);
+		let selectors: readonly EntrySelector[];
+		if(isBatch)
+		{
+			selectors = idOrPathOrPaths as readonly EntrySelector[];
+		}
+		else
+		{
+			selectors = [idOrPathOrPaths as EntrySelector];
+		}
+		const {offset, length} = normalizeRange(options);
+
+		if(isBatch)
+		{
+			const ids = await Promise.all(selectors.map(selector => this.resolveEntryId(selector)));
+			const uniqueIds = [...new Set(ids)];
+			if(!uniqueIds.length)
+			{
+				return [];
+			}
+			try
+			{
+				const buffers = await native.readMany(
+					this.handle,
+					uniqueIds.map(id => ({id, offset, length})),
+				);
+				const buffersById = new Map(uniqueIds.map((id, index) => [id, buffers[index]!]));
+				return ids.map(id => buffersById.get(id)!);
+			}
+			catch (cause)
+			{
+				throw extractionError(cause);
+			}
+		}
+
+		const idOrPath = selectors[0]!;
 		let id: EntryId;
 		if(typeof idOrPath === 'number')
 		{
@@ -1044,13 +1135,6 @@ export class Archive {
 		else
 		{
 			id = await this.resolveEntryId(idOrPath);
-		}
-		const offset = this.toUnsignedBigInt(options.offset ?? 0, 'offset');
-		const length = this.toUnsignedBigInt(options.length, 'length');
-		const maxUInt64 = (1n << 64n) - 1n;
-		if(offset > maxUInt64 || length > maxUInt64 - offset)
-		{
-			throw new ArchiveError('ERR_INVALID_RANGE', 'Read range exceeds the native 64-bit offset limit');
 		}
 		try
 		{

@@ -262,6 +262,24 @@ test('opens, indexes, partially reads, and extracts ZIP entries', async () => {
 		assert.equal((await archive.read(cover.id, {offset: 0, length: 6})).toString(), 'native');
 		assert.equal((await archive.read('chapter/cover.jpg', {offset: 0, length: 6})).toString(), 'native');
 		assert.equal((await archive.read(cover.id, {offset: 7, length: 4})).toString(), '7-Zi');
+		const batch = await archive.read(
+			[cover.id, 'empty.txt', cover.id, '読書/page.txt'],
+			{offset: 2, length: 5},
+		);
+		assert.deepEqual(batch.map(buffer => buffer.toString()), [
+			'tive ',
+			'',
+			'tive ',
+			'icode',
+		]);
+		const variedBatch = await archive.read([
+			{entry: cover.id, offset: 2, length: 5},
+			{entry: 'empty.txt', length: 4},
+			{entry: '読書/page.txt', offset: 0, length: 7},
+		]);
+		assert.deepEqual(variedBatch.map(buffer => buffer.toString()), ['tive ', '', 'Unicode']);
+		assert.deepEqual(await archive.read([], {length: 5}), []);
+		assert.deepEqual(await archive.read([]), []);
 		assert.equal((await archive.read(cover.id, {offset: cover.size, length: 12})).length, 0);
 		assert.equal((await archive.read(cover.id, {offset: 2, length: 0})).length, 0);
 		assert.equal((await archive.extract(cover.id)).toString(), 'native 7-Zip reads this image');

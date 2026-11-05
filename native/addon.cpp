@@ -558,6 +558,11 @@ struct OutputRequest {
 	std::int32_t operationResult = NArchive::NExtract::NOperationResult::kUnavailable;
 };
 
+struct ReadRange {
+	std::uint64_t offset;
+	std::uint64_t length;
+};
+
 class FileInStream final : public IInStream, public CMyUnknownImp {
 	Z7_COM_QI_BEGIN2(IInStream)
 	Z7_COM_QI_ENTRY(ISequentialInStream)
@@ -1497,13 +1502,14 @@ public:
 
 	std::vector<std::vector<std::uint8_t>> Extract(
 		const std::vector<std::uint32_t>& ids,
-		bool partial,
-		std::uint64_t offset,
-		std::uint64_t length,
+		const std::vector<ReadRange>& ranges,
 		OutputReservation& outputReservation)
 	{
 		if (contexts_.empty()) {
 			throw std::runtime_error("Archive is closed");
+		}
+		if (!ranges.empty() && ranges.size() != ids.size()) {
+			throw std::invalid_argument("Read ranges must match the requested entry count");
 		}
 		std::unordered_map<std::uint32_t, std::size_t> requestById;
 		requestById.reserve(ids.size());
@@ -1517,9 +1523,10 @@ public:
 			if (entry.directory) {
 				throw std::invalid_argument("Cannot read a directory entry");
 			}
-			const auto start = partial ? std::min(offset, entry.size) : 0;
+			const bool partial = !ranges.empty();
+			const auto start = partial ? std::min(ranges[requestIndex].offset, entry.size) : 0;
 			const auto available = entry.size - start;
-			const auto requested = partial ? std::min(length, available) : entry.size;
+			const auto requested = partial ? std::min(ranges[requestIndex].length, available) : entry.size;
 			if (!requestById.emplace(id, requestIndex).second) {
 				throw std::invalid_argument("Duplicate entry IDs are not allowed in a batch");
 			}
@@ -1532,11 +1539,13 @@ public:
 		outputReservation.Acquire(totalRequested);
 		std::vector<OutputRequest> requests;
 		requests.reserve(ids.size());
-		for (const auto id : ids) {
+		for (std::size_t requestIndex = 0; requestIndex < ids.size(); ++requestIndex) {
+			const auto id = ids[requestIndex];
 			const auto& entry = entries_[id];
-			const auto start = partial ? std::min(offset, entry.size) : 0;
+			const bool partial = !ranges.empty();
+			const auto start = partial ? std::min(ranges[requestIndex].offset, entry.size) : 0;
 			const auto available = entry.size - start;
-			const auto requested = partial ? std::min(length, available) : entry.size;
+			const auto requested = partial ? std::min(ranges[requestIndex].length, available) : entry.size;
 			OutputRequest request;
 			request.id = id;
 			request.offset = start;
@@ -1917,15 +1926,13 @@ public:
 		Napi::Promise::Deferred deferred,
 		std::shared_ptr<ArchiveEngine> archive,
 		std::vector<std::uint32_t> ids,
-		bool partial,
-		std::uint64_t offset,
-		std::uint64_t length)
+		std::vector<ReadRange> ranges,
+		bool singleOutput)
 		: deferred_(deferred),
 			archive_(std::move(archive)),
 			ids_(std::move(ids)),
-			partial_(partial),
-			offset_(offset),
-			length_(length) {}
+			ranges_(std::move(ranges)),
+			singleOutput_(singleOutput) {}
 
 	~ExtractWorker() override
 	{
@@ -1935,7 +1942,7 @@ public:
 	void Execute() noexcept override
 	{
 		try {
-			outputs_ = archive_->Extract(ids_, partial_, offset_, length_, outputReservation_);
+			outputs_ = archive_->Extract(ids_, ranges_, outputReservation_);
 		} catch (const std::exception& error) {
 			error_ = error.what();
 		} catch (...) {
@@ -1950,7 +1957,7 @@ public:
 				deferred_.Reject(Napi::Error::New(env, error_).Value());
 				return;
 			}
-			if (partial_) {
+			if (singleOutput_) {
 				deferred_.Resolve(TakeBuffer(env, std::move(outputs_.front())));
 				return;
 			}
@@ -1971,9 +1978,8 @@ private:
 	OutputReservation outputReservation_;
 	std::shared_ptr<ArchiveEngine> archive_;
 	std::vector<std::uint32_t> ids_;
-	bool partial_;
-	std::uint64_t offset_;
-	std::uint64_t length_;
+	std::vector<ReadRange> ranges_;
+	bool singleOutput_;
 	std::vector<std::vector<std::uint8_t>> outputs_;
 	std::string error_;
 };
@@ -2394,9 +2400,8 @@ Napi::Value QueueExtraction(
 	Napi::Promise::Deferred deferred,
 	std::shared_ptr<ArchiveEngine> archive,
 	std::vector<std::uint32_t> ids,
-	bool partial,
-	std::uint64_t offset,
-	std::uint64_t length)
+	std::vector<ReadRange> ranges,
+	bool singleOutput)
 {
 	if (!ReserveOperation()) {
 		throw Napi::Error::New(env, "Native operation queue is full");
@@ -2407,7 +2412,7 @@ Napi::Value QueueExtraction(
 			throw std::runtime_error("Native extraction pool is not initialized");
 		}
 		worker = new ExtractWorker(
-			deferred, std::move(archive), std::move(ids), partial, offset, length);
+			deferred, std::move(archive), std::move(ids), std::move(ranges), singleOutput);
 		g_extractionPool->Queue(env, worker);
 	} catch (const std::exception& error) {
 		if (worker != nullptr) {
@@ -2450,7 +2455,7 @@ Napi::Value Extract(const Napi::CallbackInfo& info)
 	}
 	auto deferred = Napi::Promise::Deferred::New(env);
 	return QueueExtraction(
-		env, deferred, std::move(archive), std::move(ids), false, 0, 0);
+		env, deferred, std::move(archive), std::move(ids), {}, false);
 }
 
 Napi::Value StartStream(const Napi::CallbackInfo& info)
@@ -2570,9 +2575,52 @@ Napi::Value Read(const Napi::CallbackInfo& info)
 		deferred,
 		std::move(archive),
 		{static_cast<std::uint32_t>(id)},
-		true,
-		offset,
-		length);
+		{{offset, length}},
+		true);
+}
+
+Napi::Value ReadMany(const Napi::CallbackInfo& info)
+{
+	const auto env = info.Env();
+	if (info.Length() != 2 || !info[1].IsArray()) {
+		throw Napi::TypeError::New(env, "readMany(handle, requests) expects an array of read requests");
+	}
+	const auto handle = GetHandle(info[0]);
+	auto archive = FindArchive(handle);
+	if (!archive) {
+		throw Napi::Error::New(env, "Archive is closed");
+	}
+	const auto inputRequests = info[1].As<Napi::Array>();
+	if (inputRequests.Length() > kMaxEntries) {
+		throw Napi::RangeError::New(env, "Batch read exceeds the native entry limit");
+	}
+	std::vector<std::uint32_t> ids;
+	std::vector<ReadRange> ranges;
+	ids.reserve(inputRequests.Length());
+	ranges.reserve(inputRequests.Length());
+	for (std::uint32_t i = 0; i < inputRequests.Length(); ++i) {
+		const auto value = inputRequests.Get(i);
+		if (!value.IsObject() || value.IsNull()) {
+			throw Napi::TypeError::New(env, "Batch read requests must be objects");
+		}
+		const auto request = value.As<Napi::Object>();
+		std::uint64_t id = 0;
+		std::uint64_t offset = 0;
+		std::uint64_t length = 0;
+		if (!ReadUnsigned(request.Get("id"), id) || id > std::numeric_limits<std::uint32_t>::max()
+			|| !ReadUnsigned(request.Get("offset"), offset) || !ReadUnsigned(request.Get("length"), length)) {
+			throw Napi::TypeError::New(
+				env, "Batch read requests require a valid entry ID, offset, and length");
+		}
+		if (length > kMaxReadBytes || offset > std::numeric_limits<std::uint64_t>::max() - length) {
+			throw Napi::RangeError::New(env, "Requested range exceeds the native read limit");
+		}
+		ids.push_back(static_cast<std::uint32_t>(id));
+		ranges.push_back({offset, length});
+	}
+	auto deferred = Napi::Promise::Deferred::New(env);
+	return QueueExtraction(
+		env, deferred, std::move(archive), std::move(ids), std::move(ranges), false);
 }
 
 Napi::Value Concurrency(const Napi::CallbackInfo& info)
@@ -2636,6 +2684,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports)
 	exports.Set("create", Napi::Function::New(env, CreateArchive));
 	exports.Set("entries", Napi::Function::New(env, Entries));
 	exports.Set("extract", Napi::Function::New(env, Extract));
+	exports.Set("readMany", Napi::Function::New(env, ReadMany));
 	exports.Set("startStream", Napi::Function::New(env, StartStream));
 	exports.Set("resumeStream", Napi::Function::New(env, ResumeStream));
 	exports.Set("cancelStream", Napi::Function::New(env, CancelStream));

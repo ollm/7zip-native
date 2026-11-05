@@ -109,14 +109,24 @@ const header = await archive.read(entry.path, {
 	offset: 0,
 	length: 64 * 1024,
 });
+const headers = await archive.read([first.path, second.id], {
+	offset: 0,
+	length: 64 * 1024,
+});
+const prefixes = await archive.read([
+	{entry: first.path, offset: 0, length: 8192},
+	{entry: second.id, offset: 0, length: 64},
+]);
 ```
+
+`read()` accepts one entry selector or a batch. For a selector array, the same range is used for every entry; use `ReadRequest[]` to specify a different range per entry. Both batch forms return buffers in request order and run as one native extraction operation. The selector-array form preserves repeated selectors; `ReadRequest[]` must contain unique entries.
 
 `read()` accepts these options:
 
 - `offset`: Byte position at which to start reading. Defaults to `0`; accepts a non-negative safe integer or `bigint`.
 - `length`: Number of bytes to return. Required; accepts a non-negative safe integer or `bigint`. A range read is limited to 64 MiB.
 
-A range read returns only the requested bytes. It uses the handler's normal extraction path, however, so a sequential or solid format may still need to decompress preceding data or the whole entry. It is not guaranteed to be constant-time random access.
+A range read returns only the requested bytes. A batch is limited to 64 MiB per entry and 256 MiB total output. It uses the handler's normal extraction path, however, so a sequential or solid format may still need to decompress preceding data or the whole entry. It is not guaranteed to be constant-time random access.
 
 ### Streams and output destinations
 

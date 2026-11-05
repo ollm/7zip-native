@@ -17,6 +17,10 @@ export interface ReadOptions {
 	readonly length: number | bigint;
 }
 
+export interface ReadRequest extends ReadOptions {
+	readonly entry: EntrySelector;
+}
+
 export interface OpenOptions {
 	readonly password?: string;
 }
