@@ -539,6 +539,14 @@ bool GetPropBool(IInArchive *archive, std::uint32_t index, PROPID propId)
 	return value.boolVal != VARIANT_FALSE;
 }
 
+bool IsSolidArchive(IInArchive *archive)
+{
+	NWindows::NCOM::CPropVariant value;
+	return archive->GetArchiveProperty(kpidSolid, &value) == S_OK
+		&& value.vt == VT_BOOL
+		&& value.boolVal != VARIANT_FALSE;
+}
+
 std::string GetPropString(IInArchive *archive, std::uint32_t index, PROPID propId)
 {
 	NWindows::NCOM::CPropVariant value;
@@ -554,6 +562,8 @@ struct OutputRequest {
 	std::uint64_t length = 0;
 	std::uint64_t entrySize = 0;
 	bool encrypted = false;
+	bool abortOnLimit = false;
+	bool limitReached = false;
 	std::vector<std::uint8_t> data;
 	std::int32_t operationResult = NArchive::NExtract::NOperationResult::kUnavailable;
 };
@@ -1071,6 +1081,13 @@ Z7_COM7F_IMF(VectorOutStream::Write(const void *data, UInt32 size, UInt32 *proce
 			bytes + static_cast<std::size_t>(copyEnd - start));
 	}
 	seen_ = end;
+	if (request_->abortOnLimit && request_->data.size() == request_->length) {
+		request_->limitReached = true;
+		if (processedSize != nullptr) {
+			*processedSize = 0;
+		}
+		return E_ABORT;
+	}
 	if (processedSize != nullptr) {
 		*processedSize = size;
 	}
@@ -1155,7 +1172,9 @@ Z7_COM7F_IMF(ExtractCallback::PrepareOperation(Int32))
 Z7_COM7F_IMF(ExtractCallback::SetOperationResult(Int32 operationResult))
 {
 	if (currentRequest_ != nullptr) {
-		currentRequest_->operationResult = operationResult;
+		currentRequest_->operationResult = currentRequest_->limitReached
+			? NArchive::NExtract::NOperationResult::kOK
+			: operationResult;
 	}
 	return S_OK;
 }
@@ -1558,6 +1577,11 @@ public:
 		std::vector<UInt32> sortedIds;
 		sortedIds.reserve(requestById.size());
 		for (const auto& item : requestById) {
+			auto& request = requests[item.second];
+			if (!ranges.empty() && request.length == 0) {
+				request.operationResult = NArchive::NExtract::NOperationResult::kOK;
+				continue;
+			}
 			sortedIds.push_back(item.first);
 		}
 		if (std::all_of(requests.begin(), requests.end(), [](const OutputRequest& request) {
@@ -1567,13 +1591,36 @@ public:
 		}
 		std::sort(sortedIds.begin(), sortedIds.end());
 		auto context = AcquireContext();
+		const bool abortPerItem = !ranges.empty() && !IsSolidArchive(context->archive);
+		if (abortPerItem) {
+			for (auto& request : requests) {
+				request.abortOnLimit = request.offset + request.length < request.entrySize;
+			}
+		}
 		auto *extractCallbackObject = new ExtractCallback(requests, requestById, password_);
 		CMyComPtr<IArchiveExtractCallback> callback = extractCallbackObject;
-		const auto result = context->archive->Extract(
-			sortedIds.empty() ? nullptr : sortedIds.data(),
-			static_cast<UInt32>(sortedIds.size()),
-			0,
-			callback);
+		HRESULT result = S_OK;
+		if (abortPerItem) {
+			for (const auto id : sortedIds) {
+				const auto requestIndex = requestById.at(id);
+				const UInt32 itemId = id;
+				const auto itemResult = context->archive->Extract(&itemId, 1, 0, callback);
+				if (itemResult == E_ABORT && requests[requestIndex].limitReached) {
+					requests[requestIndex].operationResult = NArchive::NExtract::NOperationResult::kOK;
+					continue;
+				}
+				if (itemResult != S_OK) {
+					result = itemResult;
+					break;
+				}
+			}
+		} else {
+			result = context->archive->Extract(
+				sortedIds.empty() ? nullptr : sortedIds.data(),
+				static_cast<UInt32>(sortedIds.size()),
+				0,
+				callback);
+		}
 		if (result != S_OK) {
 			if (extractCallbackObject->PasswordRequested()) {
 				throw std::runtime_error("Archive password is missing or incorrect");
