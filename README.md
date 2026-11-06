@@ -201,11 +201,8 @@ await archive.extractToFolder('./unpacked', {
 	paths: ['chapter/page1.jpg', 'chapter/page2.jpg'], // alternatively, use ids
 	concurrency: 2,
 	overwrite: true,
-	onProgress: ({filesExtracted, totalFiles, bytesProcessed, totalBytes, percent}) => {
-		console.log(`${filesExtracted}/${totalFiles} files, ${percent}% (${bytesProcessed}/${totalBytes} bytes)`);
-	},
-	onExtract: ({entry, outputPath}) => {
-		console.log(`Extracted ${entry.path} to ${outputPath}`);
+	onExtract: ({entry, outputPath, percent}) => {
+		console.log(`Extracted ${entry.path} to ${outputPath} (${percent}%)`);
 	},
 	maxBytes: 2n * 1024n * 1024n * 1024n,
 	signal: abortController.signal,
@@ -217,13 +214,12 @@ await archive.extractToFolder('./unpacked', {
 - `ids`: Entry IDs to extract. Omit both `ids` and `paths` to extract every entry.
 - `paths`: Exact, original archive paths to extract, using `/` separators. This cannot be combined with `ids`.
 - `concurrency`: Maximum number of native extraction batches this call runs simultaneously. Must be an integer from 1 to 128; defaults to 1 and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`.
-- `overwrite`: Defaults to `false`, so existing files are not overwritten. When `true`, each existing regular file is replaced only after its entry has been fully extracted to a temporary file alongside the destination. A failure does not truncate the existing file, but replacement may temporarily require extra disk space up to the size of the entry.
-- `onProgress`: Called before extraction, as chunks are processed, and after each file completes. Receives `filesExtracted`, `totalFiles`, aggregated `bytesProcessed`, `totalBytes`, and the calculated `percent`.
-- `onExtract`: Called as each regular file finishes writing and, when overwriting, after its final replacement; it does not wait for the rest of the batch. Concurrent extraction can make event order differ from selection order. Receives `{entry, outputPath}`; `entry` retains the original archive metadata and `outputPath` is the final destination path.
+- `overwrite`: Defaults to `false`, so existing files are not overwritten. When `true`, an existing regular file is removed before the new file is written directly to its final path. A failed extraction can leave the destination missing.
+- `onExtract`: Called after each regular file has been completely written and closed; it does not wait for the rest of the batch. Concurrent extraction can make event order differ from selection order. Receives `{entry, outputPath, percent}`, where `percent` is the completed-file count divided by the total selected regular files. `entry` retains the original archive metadata and `outputPath` is the final destination path.
 - `maxBytes`: Maximum total uncompressed output size. Defaults to 4 GiB; set to `null` to disable the limit.
 - `signal`: Optional `AbortSignal`. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
 
-Each native extraction call receives a batch of entry IDs and output paths, then writes the extracted bytes directly to disk; file contents are not streamed through Node.js or Electron. The JavaScript layer validates paths, prepares destination directories, reports progress, and performs atomic replacement when `overwrite` is enabled.
+Each native extraction call receives a batch of entry IDs and output paths. The addon queues disk writes asynchronously while 7-Zip continues extracting later entries; `onExtract` runs after that file's queued writes have completed and the file is closed. File contents are not streamed through Node.js or Electron. The `extractToFolder()` promise resolves after all `onExtract` callbacks have run.
 
 On Windows only, invalid filename characters (`< > : | ? * "`) and trailing dots/spaces in each destination component are replaced with `_`; selectors and entry metadata remain unchanged. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 

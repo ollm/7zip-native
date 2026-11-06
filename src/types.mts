@@ -39,17 +39,10 @@ export interface CreateArchiveOptions {
 	readonly overwrite?: boolean;
 }
 
-export interface ExtractToFolderProgress {
-	readonly filesExtracted: number;
-	readonly totalFiles: number;
-	readonly bytesProcessed: bigint;
-	readonly totalBytes: bigint;
-	readonly percent: number;
-}
-
 export interface ExtractedArchiveFile {
 	readonly entry: ArchiveEntry;
 	readonly outputPath: string;
+	readonly percent: number;
 }
 
 export interface ReadStreamOptions {
@@ -63,7 +56,6 @@ export interface ExtractToFolderOptions {
 	readonly paths?: readonly string[];
 	readonly concurrency?: number;
 	readonly overwrite?: boolean;
-	readonly onProgress?: (progress: ExtractToFolderProgress) => void;
 	readonly onExtract?: (result: ExtractedArchiveFile) => void;
 	readonly maxBytes?: number | bigint | null;
 	readonly signal?: AbortSignal;

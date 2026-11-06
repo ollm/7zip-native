@@ -115,9 +115,8 @@ function stubNativeFileBatchExtraction(
 	extract: (
 		outputs: readonly {id: number; path: string}[],
 		signal: AbortSignal,
-		onBytesWritten?: (bytesWritten: bigint) => void,
-		onFileCompleted?: (id: number, bytesWritten: bigint) => void,
-	) => Promise<bigint[]>,
+		onFileCompleted?: (id: number) => void,
+	) => Promise<void>,
 ): void
 {
 	assert.equal(Reflect.set(archive, 'extractEntriesToFiles', extract), true);
@@ -501,7 +500,7 @@ test('calls onExtract once per file after final output is ready', async () => {
 		['chapter/cover.jpg', Buffer.from('native 7-Zip reads this image')],
 		['empty.txt', Buffer.alloc(0)],
 	]);
-	const extracted: Array<{entry: ArchiveEntry; outputPath: string}> = [];
+	const extracted: Array<{entry: ArchiveEntry; outputPath: string; percent: number}> = [];
 	try
 	{
 		await archive.extractToFolder(destination, {
@@ -519,6 +518,7 @@ test('calls onExtract once per file after final output is ready', async () => {
 			{path: 'empty.txt', outputPath: emptyPath},
 			{path: 'chapter/cover.jpg', outputPath: coverPath},
 		].sort((left, right) => left.path.localeCompare(right.path)));
+		assert.deepEqual(extracted.map(result => result.percent), [50, 100]);
 	}
 	finally
 	{
@@ -572,12 +572,12 @@ test('sanitizes Windows output paths without changing path selectors or entry me
 	try
 	{
 		await withPlatform('win32', async () => {
-			const events: Array<{entry: ArchiveEntry; outputPath: string}> = [];
+			const events: Array<{entry: ArchiveEntry; outputPath: string; percent: number}> = [];
 			await archive.extractToFolder(byPathDestination, {
 				paths: [internalPath],
 				onExtract: (result) => events.push(result),
 			});
-			assert.deepEqual(events, [{entry, outputPath: sanitizedPath}]);
+			assert.deepEqual(events, [{entry, outputPath: sanitizedPath, percent: 100}]);
 			await archive.extractToFolder(byIdDestination, {ids: [entry.id]});
 		});
 		assert.equal((await readFile(sanitizedPath)).toString(), 'sanitized');
@@ -694,45 +694,17 @@ test('does not follow a symlink when overwriting an extracted file', async (cont
 	}
 });
 
-test('reports folder extraction progress by bytes and files', async () => {
+test('reports completion percentage with each extracted file', async () => {
 	const archive = await Archive.open(archivePath);
-	const progress: Array<{
-		filesExtracted: number;
-		totalFiles: number;
-		bytesProcessed: bigint;
-		totalBytes: bigint;
-		percent: number;
-	}> = [];
+	const extracted: Array<{path: string; percent: number}> = [];
 	try
 	{
 		await archive.extractToFolder(join(directory, 'extracted-progress'), {
 			paths: ['chapter/cover.jpg', 'empty.txt'],
-			onProgress: (update) => {
-				progress.push(update);
-			},
+			onExtract: ({entry, percent}) => extracted.push({path: entry.path, percent}),
 		});
-		assert.deepEqual(progress[0], {
-			filesExtracted: 0,
-			totalFiles: 2,
-			bytesProcessed: 0n,
-			totalBytes: 29n,
-			percent: 0,
-		});
-		assert.deepEqual(progress.find(update =>
-			update.bytesProcessed === 29n && update.filesExtracted === 0), {
-			filesExtracted: 0,
-			totalFiles: 2,
-			bytesProcessed: 29n,
-			totalBytes: 29n,
-			percent: 99,
-		});
-		assert.deepEqual(progress.at(-1), {
-			filesExtracted: 2,
-			totalFiles: 2,
-			bytesProcessed: 29n,
-			totalBytes: 29n,
-			percent: 100,
-		});
+		assert.deepEqual(extracted.map(file => file.percent), [50, 100]);
+		assert.deepEqual(extracted.map(file => file.path).sort(), ['chapter/cover.jpg', 'empty.txt']);
 	}
 	finally
 	{
@@ -757,7 +729,6 @@ test('bounds folder extraction concurrency and reports completion out of order',
 	let active = 0;
 	let maximumActive = 0;
 	const completions: string[] = [];
-	const progress: Array<{filesExtracted: number; bytesProcessed: bigint}> = [];
 	try
 	{
 		Archive.concurrency(4);
@@ -765,14 +736,12 @@ test('bounds folder extraction concurrency and reports completion out of order',
 		stubNativeFileBatchExtraction(archive, async (
 			outputs,
 			signal,
-			onBytesWritten,
 			onFileCompleted,
 		) => {
 			active++;
 			maximumActive = Math.max(maximumActive, active);
 			try
 			{
-				const bytesWritten: bigint[] = [];
 				for(const output of outputs)
 				{
 					const entry = entriesById.get(output.id);
@@ -782,33 +751,27 @@ test('bounds folder extraction concurrency and reports completion out of order',
 					{
 						await delay(5, undefined, {signal});
 						contents = Buffer.from('abc');
-						onBytesWritten?.(3n);
 						await delay(40, undefined, {signal});
 						contents = Buffer.concat([contents, Buffer.from('def')]);
-						onBytesWritten?.(3n);
 					}
 					else if(entry.path === 'fast.txt')
 					{
 						await delay(10, undefined, {signal});
 						contents = Buffer.from('wxyz');
-						onBytesWritten?.(4n);
 					}
 					else
 					{
 						await delay(5, undefined, {signal});
 						contents = Buffer.from('123');
-						onBytesWritten?.(3n);
 					}
 					await writeFile(output.path, contents);
-					bytesWritten.push(BigInt(contents.length));
-					onFileCompleted?.(output.id, BigInt(contents.length));
+					onFileCompleted?.(output.id);
 					if(entry.path === 'slow.txt')
 					{
 						await delay(20, undefined, {signal});
 						slowCompletedBeforeGroupFinished = completions.includes('slow.txt');
 					}
 				}
-				return bytesWritten;
 			}
 			finally
 			{
@@ -818,18 +781,15 @@ test('bounds folder extraction concurrency and reports completion out of order',
 
 		await archive.extractToFolder(destination, {
 			concurrency: 2,
-			onProgress: update => progress.push({
-				filesExtracted: update.filesExtracted,
-				bytesProcessed: update.bytesProcessed,
-			}),
-			onExtract: ({entry}) => completions.push(entry.path),
+			onExtract: ({entry, percent}) => {
+				completions.push(entry.path);
+				assert.equal(percent, completions.length * 100 / 3);
+			},
 		});
 		assert.equal(maximumActive, 2);
 		assert.equal(active, 0);
 		assert.deepEqual(completions, ['fast.txt', 'slow.txt', 'middle.txt']);
 		assert.equal(slowCompletedBeforeGroupFinished, true);
-		assert.ok(progress.some(update => update.filesExtracted === 0 && update.bytesProcessed === 7n));
-		assert.deepEqual(progress.at(-1), {filesExtracted: 3, bytesProcessed: 13n});
 		assert.equal(Archive.concurrency(), 4);
 		assert.deepEqual(await readFile(join(destination, 'slow.txt')), Buffer.from('abcdef'));
 		assert.deepEqual(await readFile(join(destination, 'fast.txt')), Buffer.from('wxyz'));
@@ -884,7 +844,7 @@ test('stops scheduling on extraction failure', async () => {
 	try
 	{
 		Archive.concurrency(4);
-		stubNativeFileBatchExtraction(archive, async (outputs, signal, onBytesWritten) => {
+		stubNativeFileBatchExtraction(archive, async (outputs, signal) => {
 			active++;
 			started++;
 			try
@@ -900,15 +860,11 @@ test('stops scheduling on extraction failure', async () => {
 					throw new Error('injected extraction failure');
 				}
 				await delay(1000, undefined, {signal});
-				const bytesWritten: bigint[] = [];
 				for(const {output, entry} of entries)
 				{
 					const contents = Buffer.from(entry.path);
-					onBytesWritten?.(BigInt(contents.length));
 					await writeFile(output.path, contents);
-					bytesWritten.push(BigInt(contents.length));
 				}
-				return bytesWritten;
 			}
 			finally
 			{
@@ -961,7 +917,7 @@ test('cancels active folder extractions before rejecting', async () => {
 	try
 	{
 		Archive.concurrency(4);
-		stubNativeFileBatchExtraction(archive, async (outputs, signal, onBytesWritten) => {
+		stubNativeFileBatchExtraction(archive, async (outputs, signal) => {
 			active++;
 			started++;
 			if(started === 2)
@@ -971,17 +927,13 @@ test('cancels active folder extractions before rejecting', async () => {
 			try
 			{
 				await delay(1000, undefined, {signal});
-				const bytesWritten: bigint[] = [];
 				for(const output of outputs)
 				{
 					const entry = entriesById.get(output.id);
 					assert.ok(entry);
 					const contents = Buffer.from(entry.path);
-					onBytesWritten?.(BigInt(contents.length));
 					await writeFile(output.path, contents);
-					bytesWritten.push(BigInt(contents.length));
 				}
-				return bytesWritten;
 			}
 			finally
 			{
@@ -1020,33 +972,32 @@ test('cancels active folder extractions before rejecting', async () => {
 test('cancels native file writes and removes incomplete overwritten outputs', async () => {
 	const localArchivePath = join(directory, 'cancelled-native-folder.zip');
 	const destination = join(directory, 'cancelled-native-folder-output');
-	const outputPath = join(destination, 'large.bin');
-	const previousOutput = Buffer.from('keep existing output');
+	const largeOutputPath = join(destination, 'large.bin');
 	await writeFile(localArchivePath, makeStoredZip([
-		{name: 'large.bin', data: 'x'.repeat(2 * 1024 * 1024)},
+		{name: 'first.txt', data: 'first'},
+		{name: 'large.bin', data: 'x'.repeat(64 * 1024 * 1024)},
 	]));
 	await mkdir(destination);
-	await writeFile(outputPath, previousOutput);
+	await writeFile(join(destination, 'first.txt'), 'old first');
+	await writeFile(largeOutputPath, 'old large');
 	const archive = await Archive.open(localArchivePath);
 	const controller = new AbortController();
 	try
 	{
-		await assert.rejects(
-			archive.extractToFolder(destination, {
-				paths: ['large.bin'],
-				overwrite: true,
-				signal: controller.signal,
-				onProgress: (progress) => {
-					if(progress.bytesProcessed > 0n && !controller.signal.aborted)
-					{
-						controller.abort(new Error('cancelled native file write'));
-					}
-				},
-			}),
-			/cancelled native file write/,
-		);
-		await assert.rejects(readFile(outputPath), {code: 'ENOENT'});
-		assert.deepEqual(await readdir(destination), []);
+		const abortReason = new Error('cancelled native file write');
+		await assert.rejects(archive.extractToFolder(destination, {
+			overwrite: true,
+			signal: controller.signal,
+			onExtract: ({entry}) => {
+				if(entry.path === 'first.txt')
+				{
+					controller.abort(abortReason);
+				}
+			},
+		}), error => error === abortReason);
+		assert.equal((await readFile(join(destination, 'first.txt'))).toString(), 'first');
+		await assert.rejects(readFile(largeOutputPath), {code: 'ENOENT'});
+		assert.deepEqual(await readdir(destination), ['first.txt']);
 	}
 	finally
 	{

@@ -222,7 +222,6 @@ struct StreamMessage {
 };
 
 void StreamMessageToJs(Napi::Env env, Napi::Function callback, StreamMessage *message);
-void FileProgressToJs(Napi::Env env, Napi::Function callback, std::uint64_t *byteCount);
 class FileCompletionAcknowledgement {
 public:
 	void Acknowledge()
@@ -247,8 +246,13 @@ private:
 };
 
 struct FileCompletionMessage {
+	enum class Kind {
+		File,
+		Barrier,
+	};
+
+	Kind kind;
 	std::uint32_t entryId;
-	std::uint64_t bytesWritten;
 	std::shared_ptr<FileCompletionAcknowledgement> acknowledgement;
 };
 void FileCompletionToJs(Napi::Env env, Napi::Function callback, FileCompletionMessage *message);
@@ -333,13 +337,34 @@ public:
 		return cancelled_.load(std::memory_order_acquire);
 	}
 
-	bool ReportProgress(std::uint64_t byteCount)
+	void Fail(std::string error)
 	{
-		if (!hasProgressCallback_) {
+		{
+			std::lock_guard<std::mutex> lock(failureMutex_);
+			if (failure_.empty()) {
+				failure_ = std::move(error);
+			}
+		}
+		Cancel();
+	}
+
+	std::string Failure() const
+	{
+		std::lock_guard<std::mutex> lock(failureMutex_);
+		return failure_;
+	}
+
+	bool ReportFileCompleted(std::uint32_t entryId)
+	{
+		if (!hasFileCompletionCallback_) {
 			return !IsCancelled();
 		}
-		auto *message = new std::uint64_t(byteCount);
-		const auto status = progressCallback.BlockingCall(message, FileProgressToJs);
+		auto *message = new FileCompletionMessage{
+			FileCompletionMessage::Kind::File,
+			entryId,
+			{},
+		};
+		const auto status = fileCompletionCallback.BlockingCall(message, FileCompletionToJs);
 		if (status != napi_ok) {
 			delete message;
 			Cancel();
@@ -348,13 +373,17 @@ public:
 		return !IsCancelled();
 	}
 
-	bool ReportFileCompleted(std::uint32_t entryId, std::uint64_t bytesWritten)
+	bool WaitForFileCompletions()
 	{
 		if (!hasFileCompletionCallback_) {
-			return !IsCancelled();
+			return true;
 		}
 		auto acknowledgement = std::make_shared<FileCompletionAcknowledgement>();
-		auto *message = new FileCompletionMessage{entryId, bytesWritten, acknowledgement};
+		auto *message = new FileCompletionMessage{
+			FileCompletionMessage::Kind::Barrier,
+			0,
+			acknowledgement,
+		};
 		const auto status = fileCompletionCallback.BlockingCall(message, FileCompletionToJs);
 		if (status != napi_ok) {
 			delete message;
@@ -362,31 +391,25 @@ public:
 			return false;
 		}
 		acknowledgement->Wait();
-		return !IsCancelled();
+		return true;
 	}
 
 	void ReleaseCallback()
 	{
-		if (hasProgressCallback_
-			&& !progressCallbackReleased_.exchange(true, std::memory_order_acq_rel)) {
-			progressCallback.Release();
-		}
 		if (hasFileCompletionCallback_
 			&& !fileCompletionCallbackReleased_.exchange(true, std::memory_order_acq_rel)) {
 			fileCompletionCallback.Release();
 		}
 	}
-
 	std::uint64_t id = 0;
-	Napi::ThreadSafeFunction progressCallback;
 	Napi::ThreadSafeFunction fileCompletionCallback;
-	bool hasProgressCallback_ = false;
 	bool hasFileCompletionCallback_ = false;
 
 private:
 	std::atomic<bool> cancelled_{false};
-	std::atomic<bool> progressCallbackReleased_{false};
 	std::atomic<bool> fileCompletionCallbackReleased_{false};
+	mutable std::mutex failureMutex_;
+	std::string failure_;
 };
 
 std::uint64_t RegisterStream(std::shared_ptr<NativeStreamState> stream)
@@ -1473,27 +1496,17 @@ Z7_COM7F_IMF(StreamingExtractCallback::CryptoGetTextPassword(BSTR *password))
 	return GetPasswordBstr(password_, password);
 }
 
-class NativeFileOutStream final : public ISequentialOutStream, public CMyUnknownImp {
-	Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
-	Z7_COM7F_IMP(Write(const void *data, UInt32 size, UInt32 *processedSize))
-
+class NativeFileOutputState {
 public:
-	NativeFileOutStream(
-		std::string path,
-		std::uint64_t expectedSize,
-		std::shared_ptr<NativeFileTaskState> task,
-		bool overwrite)
-		: path_(std::move(path)),
+	NativeFileOutputState(std::uint32_t id, std::string path, std::uint64_t expectedSize, bool overwrite)
+		: id_(id),
+			path_(std::move(path)),
 			expectedSize_(expectedSize),
-			task_(std::move(task)),
 			overwrite_(overwrite) {}
 
-	~NativeFileOutStream()
+	~NativeFileOutputState()
 	{
-		Close();
-		if (fileCreated_ && !completed_) {
-			RemoveOutputFile();
-		}
+		Abort();
 	}
 
 	bool Open()
@@ -1526,6 +1539,41 @@ public:
 		return true;
 	}
 
+	bool Write(const std::vector<std::uint8_t>& data)
+	{
+		std::size_t offset = 0;
+		while (offset < data.size()) {
+#ifdef _WIN32
+			const auto written = ::_write(
+				fileDescriptor_,
+				data.data() + offset,
+				static_cast<unsigned int>(data.size() - offset));
+#else
+			const auto written = ::write(
+				fileDescriptor_,
+				data.data() + offset,
+				data.size() - offset);
+#endif
+			if (written < 0) {
+#ifndef _WIN32
+				if (errno == EINTR) {
+					continue;
+				}
+#endif
+				SetError("Unable to write extraction output file");
+				return false;
+			}
+			if (written == 0) {
+				SetError("Unable to write extraction output file");
+				return false;
+			}
+			const auto count = static_cast<std::size_t>(written);
+			offset += count;
+			bytesWritten_ += count;
+		}
+		return true;
+	}
+
 	bool Close()
 	{
 		if (fileDescriptor_ < 0) {
@@ -1544,30 +1592,44 @@ public:
 		return true;
 	}
 
+	void Abort()
+	{
+		Close();
+		if (fileCreated_ && !completed_) {
+			RemoveOutputFile();
+			fileCreated_ = false;
+		}
+	}
+
 	void MarkCompleted()
 	{
 		completed_ = true;
 	}
 
-	std::uint64_t BytesWritten() const
+	void AddQueuedBytes(std::uint64_t bytes)
 	{
-		return bytesWritten_;
+		bytesQueued_ += bytes;
 	}
 
-	bool SizeLimitExceeded() const
+	void MarkSizeLimitExceeded()
 	{
-		return sizeLimitExceeded_;
+		sizeLimitExceeded_ = true;
 	}
 
-	const std::string& Error() const
-	{
-		return error_;
-	}
+	std::uint32_t Id() const { return id_; }
+	std::uint64_t ExpectedSize() const { return expectedSize_; }
+	std::uint64_t BytesQueued() const { return bytesQueued_; }
+	std::uint64_t BytesWritten() const { return bytesWritten_; }
+	bool Completed() const { return completed_; }
+	bool SizeLimitExceeded() const { return sizeLimitExceeded_; }
+	const std::string& Error() const { return error_; }
 
 private:
 	void SetError(const char *message)
 	{
-		error_ = std::string(message) + ": " + std::strerror(errno);
+		if (error_.empty()) {
+			error_ = std::string(message) + ": " + std::strerror(errno);
+		}
 	}
 
 	bool RemoveOutputFile()
@@ -1585,16 +1647,273 @@ private:
 		return false;
 	}
 
+	std::uint32_t id_;
 	std::string path_;
 	int fileDescriptor_ = -1;
 	std::uint64_t expectedSize_;
-	std::shared_ptr<NativeFileTaskState> task_;
 	bool overwrite_;
 	bool fileCreated_ = false;
 	bool completed_ = false;
+	std::uint64_t bytesQueued_ = 0;
 	std::uint64_t bytesWritten_ = 0;
 	bool sizeLimitExceeded_ = false;
 	std::string error_;
+};
+
+class AsyncFileWriter {
+public:
+	explicit AsyncFileWriter(std::shared_ptr<NativeFileTaskState> task)
+		: task_(std::move(task)) {}
+
+	~AsyncFileWriter()
+	{
+		StopAndJoin();
+	}
+
+	void Start()
+	{
+		worker_ = std::thread([this] { Run(); });
+	}
+
+	bool EnqueueWrite(
+		const std::shared_ptr<NativeFileOutputState>& output,
+		const std::uint8_t *data,
+		std::size_t size)
+	{
+		try {
+			std::vector<std::uint8_t> copy(data, data + size);
+			std::unique_lock<std::mutex> lock(mutex_);
+			spaceAvailable_.wait(lock, [this, size] {
+				return stopping_
+					|| task_->IsCancelled()
+					|| (HasQueueSpace() && queuedBytes_ + size <= kMaxQueuedBytes);
+			});
+			if (stopping_ || task_->IsCancelled()) {
+				return false;
+			}
+			queue_.push_back({Job::Kind::Write, output, std::move(copy)});
+			queuedBytes_ += size;
+		} catch (const std::exception& error) {
+			task_->Fail(error.what());
+			return false;
+		} catch (...) {
+			task_->Fail("Unable to queue extraction output data");
+			return false;
+		}
+		workAvailable_.notify_one();
+		return true;
+	}
+
+	bool EnqueueFinish(const std::shared_ptr<NativeFileOutputState>& output)
+	{
+		try {
+			{
+				std::unique_lock<std::mutex> lock(mutex_);
+				spaceAvailable_.wait(lock, [this] {
+					return stopping_ || HasQueueSpace();
+				});
+				if (stopping_) {
+					return false;
+				}
+				queue_.push_back({Job::Kind::Finish, output, {}});
+			}
+			workAvailable_.notify_one();
+			return true;
+		} catch (const std::exception& error) {
+			task_->Fail(error.what());
+			return false;
+		} catch (...) {
+			task_->Fail("Unable to queue extraction output completion");
+			return false;
+		}
+	}
+
+	bool EnqueueAbort(const std::shared_ptr<NativeFileOutputState>& output) noexcept
+	{
+		try {
+			{
+				std::unique_lock<std::mutex> lock(mutex_);
+				spaceAvailable_.wait(lock, [this] {
+					return stopping_ || HasQueueSpace();
+				});
+				if (stopping_) {
+					return false;
+				}
+				queue_.push_back({Job::Kind::Abort, output, {}});
+			}
+			workAvailable_.notify_one();
+			return true;
+		} catch (...) {
+			return false;
+		}
+	}
+
+	void WaitUntilIdle()
+	{
+		std::unique_lock<std::mutex> lock(mutex_);
+		idle_.wait(lock, [this] { return queue_.empty() && !active_; });
+	}
+
+	void StopAndJoin()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			stopping_ = true;
+		}
+		workAvailable_.notify_all();
+		spaceAvailable_.notify_all();
+		if (worker_.joinable()) {
+			worker_.join();
+		}
+	}
+
+private:
+	struct Job {
+		enum class Kind {
+			Write,
+			Finish,
+			Abort,
+		};
+
+		Kind kind;
+		std::shared_ptr<NativeFileOutputState> output;
+		std::vector<std::uint8_t> data;
+	};
+
+	static constexpr std::size_t kMaxQueuedBytes = 8 * 1024 * 1024;
+	static constexpr std::size_t kMaxQueuedJobs = 1024;
+
+	bool HasQueueSpace() const
+	{
+		return queue_.size() + (active_ ? 1 : 0) < kMaxQueuedJobs;
+	}
+
+	void Run() noexcept
+	{
+		while (true) {
+			Job job;
+			{
+				std::unique_lock<std::mutex> lock(mutex_);
+				workAvailable_.wait(lock, [this] {
+					return stopping_ || !queue_.empty();
+				});
+				if (queue_.empty() && stopping_) {
+					idle_.notify_all();
+					return;
+				}
+				job = std::move(queue_.front());
+				queue_.pop_front();
+				active_ = true;
+			}
+
+			try {
+				Process(job);
+			} catch (const std::exception& error) {
+				task_->Fail(error.what());
+				job.output->Abort();
+			} catch (...) {
+				task_->Fail("Unknown asynchronous extraction output failure");
+				job.output->Abort();
+			}
+
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (job.kind == Job::Kind::Write) {
+					queuedBytes_ -= job.data.size();
+				}
+				active_ = false;
+				if (queue_.empty()) {
+					idle_.notify_all();
+				}
+			}
+			spaceAvailable_.notify_all();
+		}
+	}
+
+	void Process(const Job& job)
+	{
+		if (job.kind == Job::Kind::Abort) {
+			job.output->Abort();
+			return;
+		}
+		if (job.kind == Job::Kind::Write) {
+			if (task_->IsCancelled()) {
+				return;
+			}
+			if (!job.output->Write(job.data)) {
+				const auto& error = job.output->Error();
+				task_->Fail(error.empty() ? "Unable to write extraction output file" : error);
+				job.output->Abort();
+			}
+			return;
+		}
+		if (task_->IsCancelled()) {
+			job.output->Abort();
+			return;
+		}
+		if (!job.output->Close()) {
+			const auto& error = job.output->Error();
+			task_->Fail(error.empty() ? "Unable to close extraction output file" : error);
+			job.output->Abort();
+			return;
+		}
+		job.output->MarkCompleted();
+		task_->ReportFileCompleted(job.output->Id());
+	}
+
+	std::shared_ptr<NativeFileTaskState> task_;
+	std::mutex mutex_;
+	std::condition_variable workAvailable_;
+	std::condition_variable spaceAvailable_;
+	std::condition_variable idle_;
+	std::deque<Job> queue_;
+	std::size_t queuedBytes_ = 0;
+	bool active_ = false;
+	bool stopping_ = false;
+	std::thread worker_;
+};
+
+class NativeFileOutStream final : public ISequentialOutStream, public CMyUnknownImp {
+	Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+	Z7_COM7F_IMP(Write(const void *data, UInt32 size, UInt32 *processedSize))
+
+public:
+	NativeFileOutStream(
+		std::shared_ptr<NativeFileOutputState> output,
+		AsyncFileWriter& writer,
+		std::shared_ptr<NativeFileTaskState> task)
+		: output_(std::move(output)),
+			writer_(writer),
+			task_(std::move(task)) {}
+
+	~NativeFileOutStream()
+	{
+		if (!terminalQueued_) {
+			writer_.EnqueueAbort(output_);
+		}
+	}
+
+	bool Finish()
+	{
+		if (terminalQueued_) {
+			return true;
+		}
+		terminalQueued_ = writer_.EnqueueFinish(output_);
+		return terminalQueued_;
+	}
+
+	void Abort()
+	{
+		if (!terminalQueued_) {
+			terminalQueued_ = writer_.EnqueueAbort(output_);
+		}
+	}
+
+private:
+	std::shared_ptr<NativeFileOutputState> output_;
+	AsyncFileWriter& writer_;
+	std::shared_ptr<NativeFileTaskState> task_;
+	bool terminalQueued_ = false;
 };
 
 Z7_COM7F_IMF(NativeFileOutStream::Write(
@@ -1606,8 +1925,9 @@ Z7_COM7F_IMF(NativeFileOutStream::Write(
 	if (task_->IsCancelled()) {
 		return E_ABORT;
 	}
-	if (size > expectedSize_ - std::min(expectedSize_, bytesWritten_)) {
-		sizeLimitExceeded_ = true;
+	if (size > output_->ExpectedSize() - std::min(
+			output_->ExpectedSize(), output_->BytesQueued())) {
+		output_->MarkSizeLimitExceeded();
 		return E_ABORT;
 	}
 
@@ -1618,37 +1938,10 @@ Z7_COM7F_IMF(NativeFileOutStream::Write(
 			return E_ABORT;
 		}
 		const auto chunkSize = std::min<std::uint32_t>(64 * 1024, size - offset);
-		if (!task_->ReportProgress(chunkSize)) {
-			return E_ABORT;
+		if (!writer_.EnqueueWrite(output_, bytes + offset, chunkSize)) {
+			return task_->IsCancelled() ? E_ABORT : E_FAIL;
 		}
-		std::uint32_t chunkOffset = 0;
-		while (chunkOffset < chunkSize) {
-#ifdef _WIN32
-			const auto written = ::_write(
-				fileDescriptor_,
-				bytes + offset + chunkOffset,
-				static_cast<unsigned int>(chunkSize - chunkOffset));
-#else
-			const auto written = ::write(
-				fileDescriptor_,
-				bytes + offset + chunkOffset,
-				chunkSize - chunkOffset);
-#endif
-			if (written < 0) {
-#ifndef _WIN32
-				if (errno == EINTR) {
-					continue;
-				}
-#endif
-				return E_FAIL;
-			}
-			if (written == 0) {
-				return E_FAIL;
-			}
-			const auto count = static_cast<std::uint32_t>(written);
-			chunkOffset += count;
-			bytesWritten_ += count;
-		}
+		output_->AddQueuedBytes(chunkSize);
 		offset += chunkSize;
 	}
 	if (processedSize != nullptr) {
@@ -1670,6 +1963,7 @@ struct FileOutputRequest {
 	bool overwrite = false;
 	std::int32_t operationResult = NArchive::NExtract::NOperationResult::kUnavailable;
 	NativeFileOutStream *stream = nullptr;
+	std::shared_ptr<NativeFileOutputState> output;
 	std::string error;
 };
 
@@ -1692,10 +1986,12 @@ public:
 		std::vector<FileOutputRequest>& requests,
 		const std::unordered_map<std::uint32_t, std::size_t>& requestById,
 		std::shared_ptr<NativeFileTaskState> task,
+		AsyncFileWriter& writer,
 		const std::optional<std::string>& password)
 		: requests_(requests),
 			requestById_(requestById),
 			task_(std::move(task)),
+			writer_(writer),
 			password_(password),
 			currentRequest_(nullptr),
 			passwordRequested_(false) {}
@@ -1709,6 +2005,7 @@ private:
 	std::vector<FileOutputRequest>& requests_;
 	const std::unordered_map<std::uint32_t, std::size_t>& requestById_;
 	std::shared_ptr<NativeFileTaskState> task_;
+	AsyncFileWriter& writer_;
 	const std::optional<std::string>& password_;
 	FileOutputRequest *currentRequest_;
 	std::atomic<bool> passwordRequested_;
@@ -1742,13 +2039,15 @@ Z7_COM7F_IMF(BatchFileExtractCallback::GetStream(
 	}
 	auto& request = requests_[found->second];
 	currentRequest_ = &request;
-	auto *fileStream = new NativeFileOutStream(
-		request.path, request.expectedSize, task_, request.overwrite);
-	CMyComPtr<ISequentialOutStream> output = fileStream;
-	if (!fileStream->Open()) {
-		request.error = fileStream->Error();
+	request.output = std::make_shared<NativeFileOutputState>(
+		request.id, request.path, request.expectedSize, request.overwrite);
+	if (!request.output->Open()) {
+		request.error = request.output->Error();
 		return E_FAIL;
 	}
+	auto *fileStream = new NativeFileOutStream(
+		request.output, writer_, task_);
+	CMyComPtr<ISequentialOutStream> output = fileStream;
 	request.stream = fileStream;
 	streams_.push_back(output);
 	*outStream = output;
@@ -1765,19 +2064,17 @@ Z7_COM7F_IMF(BatchFileExtractCallback::SetOperationResult(Int32 operationResult)
 {
 	if (currentRequest_ != nullptr) {
 		currentRequest_->operationResult = operationResult;
-		if (currentRequest_->stream != nullptr && !currentRequest_->stream->Close()) {
-			currentRequest_->error = currentRequest_->stream->Error();
-		}
 		if (operationResult == NArchive::NExtract::NOperationResult::kOK
 			&& currentRequest_->stream != nullptr
 			&& currentRequest_->error.empty()
-			&& !currentRequest_->stream->SizeLimitExceeded()) {
-			currentRequest_->stream->MarkCompleted();
-			if (!task_->ReportFileCompleted(
-					currentRequest_->id,
-					currentRequest_->stream->BytesWritten())) {
+			&& currentRequest_->output != nullptr
+			&& !currentRequest_->output->SizeLimitExceeded()) {
+			if (!currentRequest_->stream->Finish()) {
+				currentRequest_->error = task_->Failure();
 				return E_ABORT;
 			}
+		} else if (currentRequest_->stream != nullptr) {
+			currentRequest_->stream->Abort();
 		}
 	}
 	return S_OK;
@@ -2224,18 +2521,22 @@ public:
 		}
 	}
 
-	std::vector<std::uint64_t> ExtractToFiles(
+	void ExtractToFiles(
 		const std::vector<NativeFileOutputSpec>& outputs,
-		const std::shared_ptr<NativeFileTaskState>& task)
+		const std::shared_ptr<NativeFileTaskState>& task,
+		AsyncFileWriter& writer)
 	{
 		if (contexts_.empty()) {
 			throw std::runtime_error("Archive is closed");
 		}
 		if (task->IsCancelled()) {
-			throw std::runtime_error("Native folder extraction was cancelled");
+			const auto failure = task->Failure();
+			throw std::runtime_error(failure.empty()
+				? "Native folder extraction was cancelled"
+				: failure);
 		}
 		if (outputs.empty()) {
-			return {};
+			return;
 		}
 
 		std::vector<FileOutputRequest> requests;
@@ -2266,24 +2567,35 @@ public:
 				output.overwrite,
 				NArchive::NExtract::NOperationResult::kUnavailable,
 				nullptr,
+				nullptr,
 				{},
 			});
 			sortedIds.push_back(id);
 		}
 		std::sort(sortedIds.begin(), sortedIds.end());
 
-		auto context = AcquireContext();
-		auto *extractCallbackObject = new BatchFileExtractCallback(
-			requests, requestById, task, password_);
-		CMyComPtr<IArchiveExtractCallback> callback = extractCallbackObject;
-		if (g_setDeflateInputBufferSize(deflateBufferSize_) != S_OK) {
-			throw std::runtime_error("Unable to configure the Deflate input buffer");
+		HRESULT result = E_FAIL;
+		bool passwordRequested = false;
+		{
+			auto context = AcquireContext();
+			auto *extractCallbackObject = new BatchFileExtractCallback(
+				requests, requestById, task, writer, password_);
+			CMyComPtr<IArchiveExtractCallback> callback = extractCallbackObject;
+			if (g_setDeflateInputBufferSize(deflateBufferSize_) != S_OK) {
+				throw std::runtime_error("Unable to configure the Deflate input buffer");
+			}
+			result = context->archive->Extract(
+				sortedIds.data(),
+				static_cast<UInt32>(sortedIds.size()),
+				0,
+				callback);
+			passwordRequested = extractCallbackObject->PasswordRequested();
 		}
-		const auto result = context->archive->Extract(
-			sortedIds.data(),
-			static_cast<UInt32>(sortedIds.size()),
-			0,
-			callback);
+		writer.WaitUntilIdle();
+		const auto writerFailure = task->Failure();
+		if (!writerFailure.empty()) {
+			throw std::runtime_error(writerFailure);
+		}
 		if (task->IsCancelled()) {
 			throw std::runtime_error("Native folder extraction was cancelled");
 		}
@@ -2291,22 +2603,20 @@ public:
 			if (!request.error.empty()) {
 				throw std::runtime_error(request.error);
 			}
-			if (request.stream != nullptr && request.stream->SizeLimitExceeded()) {
+			if (request.output != nullptr && request.output->SizeLimitExceeded()) {
 				throw std::runtime_error(
 					"Extracted entry exceeds its declared size: " + request.path);
 			}
 		}
 		if (result != S_OK) {
-			if (extractCallbackObject->PasswordRequested()) {
+			if (passwordRequested) {
 				throw std::runtime_error("Archive password is missing or incorrect");
 			}
 			throw std::runtime_error("7-Zip failed to extract the requested files");
 		}
-		std::vector<std::uint64_t> bytesWritten;
-		bytesWritten.reserve(requests.size());
 		for (const auto& request : requests) {
 			if (request.operationResult != NArchive::NExtract::NOperationResult::kOK) {
-				if (extractCallbackObject->PasswordRequested()) {
+				if (passwordRequested) {
 					throw std::runtime_error("Archive password is incorrect or encrypted data is invalid");
 				}
 				if (request.operationResult == NArchive::NExtract::NOperationResult::kWrongPassword) {
@@ -2316,10 +2626,13 @@ public:
 					"Entry extraction failed (unsupported method, integrity error, or password required): "
 					+ request.path);
 			}
-			bytesWritten.push_back(
-				request.stream != nullptr ? request.stream->BytesWritten() : 0);
+			if (request.output == nullptr || !request.output->Completed()) {
+				throw std::runtime_error("Entry output did not finish writing: " + request.path);
+			}
+			if (request.output->BytesWritten() != request.output->BytesQueued()) {
+				throw std::runtime_error("Entry output write count is inconsistent: " + request.path);
+			}
 		}
-		return bytesWritten;
 	}
 
 private:
@@ -2507,27 +2820,19 @@ void StreamMessageToJs(Napi::Env env, Napi::Function callback, StreamMessage *me
 	}
 }
 
-void FileProgressToJs(Napi::Env env, Napi::Function callback, std::uint64_t *byteCount)
-{
-	std::unique_ptr<std::uint64_t> owned(byteCount);
-	if (env != nullptr && callback) {
-		callback.Call({Napi::BigInt::New(env, *byteCount)});
-	}
-}
-
 void FileCompletionToJs(
 	Napi::Env env,
 	Napi::Function callback,
 	FileCompletionMessage *message)
 {
 	std::unique_ptr<FileCompletionMessage> owned(message);
-	if (env != nullptr && callback) {
-		callback.Call({
-			Napi::Number::New(env, message->entryId),
-			Napi::BigInt::New(env, message->bytesWritten),
-		});
+	if (message->kind == FileCompletionMessage::Kind::Barrier) {
+		message->acknowledgement->Acknowledge();
+		return;
 	}
-	message->acknowledgement->Acknowledge();
+	if (env != nullptr && callback) {
+		callback.Call({Napi::Number::New(env, message->entryId)});
+	}
 }
 
 class BoundedAsyncWorker : public Napi::AsyncWorker {
@@ -2879,12 +3184,24 @@ public:
 
 	void Execute() noexcept override
 	{
+		AsyncFileWriter writer(task_);
 		try {
-			bytesWritten_ = archive_->ExtractToFiles(outputs_, task_);
+			writer.Start();
+			archive_->ExtractToFiles(outputs_, task_, writer);
 		} catch (const std::exception& error) {
 			error_ = error.what();
 		} catch (...) {
 			error_ = "Unknown native file extraction failure";
+		}
+		writer.StopAndJoin();
+		if (error_.empty()) {
+			error_ = task_->Failure();
+			if (error_.empty() && task_->IsCancelled()) {
+				error_ = "Native folder extraction was cancelled";
+			}
+		}
+		if (!task_->WaitForFileCompletions() && error_.empty()) {
+			error_ = "Unable to deliver native file completion events";
 		}
 	}
 
@@ -2894,11 +3211,7 @@ public:
 			deferred_.Reject(Napi::Error::New(env, error_).Value());
 			return;
 		}
-		Napi::Array result = Napi::Array::New(env, bytesWritten_.size());
-		for (std::size_t index = 0; index < bytesWritten_.size(); ++index) {
-			result.Set(index, Napi::BigInt::New(env, bytesWritten_[index]));
-		}
-		deferred_.Resolve(result);
+		deferred_.Resolve(env.Undefined());
 	}
 
 private:
@@ -2906,7 +3219,6 @@ private:
 	std::shared_ptr<ArchiveEngine> archive_;
 	std::vector<NativeFileOutputSpec> outputs_;
 	std::shared_ptr<NativeFileTaskState> task_;
-	std::vector<std::uint64_t> bytesWritten_;
 	std::string error_;
 };
 
@@ -3343,12 +3655,11 @@ Napi::Value StartExtractToFiles(const Napi::CallbackInfo& info)
 {
 	const auto env = info.Env();
 	if (info.Length() < 2
-		|| info.Length() > 4
+		|| info.Length() > 3
 		|| !info[1].IsArray()
-		|| (info.Length() >= 3 && !info[2].IsUndefined() && !info[2].IsFunction())
-		|| (info.Length() == 4 && !info[3].IsUndefined() && !info[3].IsFunction())) {
+		|| (info.Length() == 3 && !info[2].IsUndefined() && !info[2].IsFunction())) {
 		throw Napi::TypeError::New(
-			env, "startExtractToFiles(handle, files, progressCallback?, fileCompleteCallback?) expects a handle, file list, and optional callbacks");
+			env, "startExtractToFiles(handle, files, fileCompleteCallback?) expects a handle, file list, and an optional file-completion callback");
 	}
 	const auto handle = GetHandle(info[0]);
 	auto archive = FindArchive(handle);
@@ -3395,19 +3706,10 @@ Napi::Value StartExtractToFiles(const Napi::CallbackInfo& info)
 	std::uint64_t taskId = 0;
 	try {
 		task = std::make_shared<NativeFileTaskState>();
-		if (info.Length() >= 3 && info[2].IsFunction()) {
-			task->progressCallback = Napi::ThreadSafeFunction::New(
-				env,
-				info[2].As<Napi::Function>(),
-				"7zip-native folder extraction progress",
-				1,
-				1);
-			task->hasProgressCallback_ = true;
-		}
-		if (info.Length() == 4 && info[3].IsFunction()) {
+		if (info.Length() == 3 && info[2].IsFunction()) {
 			task->fileCompletionCallback = Napi::ThreadSafeFunction::New(
 				env,
-				info[3].As<Napi::Function>(),
+				info[2].As<Napi::Function>(),
 				"7zip-native folder file completion",
 				1,
 				1);

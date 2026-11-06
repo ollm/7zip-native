@@ -31,7 +31,6 @@ export type {
 	EntryId,
 	EntrySelector,
 	ExtractedArchiveFile,
-	ExtractToFolderProgress,
 	ExtractToFolderOptions,
 	OpenOptions,
 	ReadOptions,
@@ -45,12 +44,11 @@ type NativeStreamCallback = (
 	done: boolean,
 ) => void;
 
-type NativeFileProgressCallback = (bytesWritten: bigint) => void;
-type NativeFileCompletionCallback = (id: number, bytesWritten: bigint) => void;
+type NativeFileCompletionCallback = (id: number) => void;
 
 interface NativeFileTask {
 	readonly taskId: bigint;
-	readonly promise: Promise<bigint[]>;
+	readonly promise: Promise<void>;
 }
 
 interface NativeFileOutput {
@@ -109,7 +107,6 @@ interface NativeBinding {
 	startExtractToFiles(
 		handle: bigint,
 		outputs: readonly NativeFileOutput[],
-		progressCallback?: NativeFileProgressCallback,
 		fileCompletionCallback?: NativeFileCompletionCallback,
 	): NativeFileTask;
 	cancelExtractToFiles(taskId: bigint): void;
@@ -887,10 +884,6 @@ export class Archive {
 		{
 			throw new RangeError('Folder extraction concurrency must be an integer between 1 and 128');
 		}
-		if(options.onProgress !== undefined && typeof options.onProgress !== 'function')
-		{
-			throw new TypeError('Folder extraction onProgress option must be a function');
-		}
 		if(options.onExtract !== undefined && typeof options.onExtract !== 'function')
 		{
 			throw new TypeError('Folder extraction onExtract option must be a function');
@@ -942,11 +935,11 @@ export class Archive {
 
 		const root = resolve(destination);
 		const plans = makeOutputPlans(root, selectedEntries);
-		const expectedBytes = selectedEntries.reduce(
+		const totalBytes = selectedEntries.reduce(
 			(total, entry) => total + (entry.isDirectory ? 0n : entry.size),
 			0n,
 		);
-		if(maxBytes !== null && expectedBytes > maxBytes)
+		if(maxBytes !== null && totalBytes > maxBytes)
 		{
 			throw new ArchiveError(
 				'ERR_RESOURCE_LIMIT',
@@ -956,29 +949,7 @@ export class Archive {
 		options.signal?.throwIfAborted();
 		await ensureExtractionRoot(root);
 
-		let extractedBytes = 0n;
 		let filesExtracted = 0;
-		const totalFiles = plans.filter(plan => !plan.isDirectory).length;
-		const reportProgress = (): void => {
-			let percent = 0;
-			if(expectedBytes > 0n)
-			{
-				const scaledPercent = extractedBytes * 10000n / expectedBytes;
-				percent = Number(scaledPercent > 9900n ? 9900n : scaledPercent) / 100;
-			}
-			if(filesExtracted === totalFiles)
-			{
-				percent = 100;
-			}
-			options.onProgress?.({
-				filesExtracted,
-				totalFiles,
-				bytesProcessed: extractedBytes,
-				totalBytes: expectedBytes,
-				percent,
-			});
-		};
-		reportProgress();
 		for(const plan of plans)
 		{
 			options.signal?.throwIfAborted();
@@ -1009,26 +980,6 @@ export class Archive {
 		};
 		options.signal?.addEventListener('abort', abortFromCaller, {once: true});
 
-		let reportBytesWritten: NativeFileProgressCallback | undefined;
-		if(options.onProgress)
-		{
-			reportBytesWritten = (bytesWritten) => {
-				if(hasFailure)
-				{
-					return;
-				}
-				extractedBytes += bytesWritten;
-				try
-				{
-					reportProgress();
-				}
-				catch (error)
-				{
-					stop(error);
-				}
-			};
-		}
-
 		const groupCount = Math.min(concurrency, filePlans.length);
 		const fileGroups = Array.from({length: groupCount}, () => [] as OutputPlan[]);
 		filePlans.forEach((plan, index) => {
@@ -1038,7 +989,6 @@ export class Archive {
 			const outputs: NativeFileOutput[] = [];
 			let completionFailed = false;
 			let completionFailure: unknown;
-			const completedFileIds = new Set<number>();
 			try
 			{
 				for(const plan of group)
@@ -1060,37 +1010,33 @@ export class Archive {
 					});
 				}
 
-				const reportFileCompletions = options.onProgress !== undefined
-					|| options.onExtract !== undefined;
-				const outputIndices = new Map(outputs.map((output, index) => [output.id, index]));
 				let onFileCompleted: NativeFileCompletionCallback | undefined;
-				if(reportFileCompletions)
+				const onExtract = options.onExtract;
+				if(onExtract)
 				{
-					onFileCompleted = (id, bytesWritten) => {
+					const plansById = new Map(group.map(plan => [plan.entry.id, plan]));
+					onFileCompleted = (id) => {
 						if(completionFailed || hasFailure)
 						{
 							return;
 						}
 						try
 						{
-							const index = outputIndices.get(id);
-							if(index === undefined || completedFileIds.has(id))
+							const plan = plansById.get(id);
+							if(plan === undefined)
 							{
 								throw new ArchiveError(
 									'ERR_ARCHIVE_EXTRACT',
-									'Native folder extraction returned an invalid file completion',
+									'Native folder extraction returned an unknown file completion',
 								);
-							}
-							completedFileIds.add(id);
-							const plan = group[index]!;
-							if(reportBytesWritten === undefined)
-							{
-								extractedBytes += bytesWritten;
 							}
 							extractionSignal.throwIfAborted();
 							filesExtracted++;
-							reportProgress();
-							options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
+							onExtract({
+								entry: plan.entry,
+								outputPath: plan.targetPath,
+								percent: filesExtracted * 100 / filePlans.length,
+							});
 						}
 						catch (error)
 						{
@@ -1100,47 +1046,14 @@ export class Archive {
 						}
 					};
 				}
-				const bytesWritten = await this.extractEntriesToFiles(
+				await this.extractEntriesToFiles(
 					outputs,
 					extractionSignal,
-					reportBytesWritten,
 					onFileCompleted,
 				);
-				if(onFileCompleted)
+				if(completionFailed)
 				{
-					if(completionFailed)
-					{
-						throw completionFailure;
-					}
-					if(completedFileIds.size !== group.length)
-					{
-						throw new ArchiveError(
-							'ERR_ARCHIVE_EXTRACT',
-							'Native folder extraction returned an incomplete file completion list',
-						);
-					}
-				}
-				if(bytesWritten.length !== group.length)
-				{
-					throw new ArchiveError(
-						'ERR_ARCHIVE_EXTRACT',
-						'Native folder extraction returned an incomplete result',
-					);
-				}
-				if(!onFileCompleted)
-				{
-					for(let index = 0; index < group.length; index++)
-					{
-						const plan = group[index]!;
-						if(reportBytesWritten === undefined)
-						{
-							extractedBytes += bytesWritten[index]!;
-						}
-						extractionSignal.throwIfAborted();
-						filesExtracted++;
-						reportProgress();
-						options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
-					}
+					throw completionFailure;
 				}
 			}
 			catch (caughtError)
@@ -1280,9 +1193,8 @@ export class Archive {
 	private async extractEntriesToFiles(
 		outputs: readonly NativeFileOutput[],
 		signal: AbortSignal,
-		onBytesWritten?: NativeFileProgressCallback,
 		onFileCompleted?: NativeFileCompletionCallback,
-	): Promise<bigint[]> {
+	): Promise<void> {
 		let task: NativeFileTask | undefined;
 		const cancelTask = (): void => {
 			if(task)
@@ -1296,7 +1208,6 @@ export class Archive {
 			task = native.startExtractToFiles(
 				this.handle,
 				outputs,
-				onBytesWritten,
 				onFileCompleted,
 			);
 			signal.addEventListener('abort', cancelTask, {once: true});

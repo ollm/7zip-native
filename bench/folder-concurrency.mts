@@ -1,7 +1,7 @@
 import {mkdtemp, rm, stat} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
-import {Archive, type ExtractToFolderProgress} from '../dist/index.mjs';
+import {Archive} from '../dist/index.mjs';
 
 const usage = 'npm run benchmark:folder-concurrency -- --archive <path> [--archive <path> ...] [--iterations <count>] [--concurrency <workers> | --concurrencies <workers,...>]';
 const archivePaths: string[] = [];
@@ -119,27 +119,20 @@ try
 				for(let iteration = 0; iteration < iterations; iteration++)
 				{
 					const temporaryDirectory = await mkdtemp(join(tmpdir(), '7zip-native-folder-bench-'));
-					let finalProgress: ExtractToFolderProgress | undefined;
+					let finalPercent = 0;
 					let completedFiles = 0;
 					try
 					{
 						const start = process.hrtime.bigint();
 						await archive.extractToFolder(join(temporaryDirectory, 'output'), {
 							concurrency,
-							onProgress: progress => {
-								finalProgress = progress;
-							},
-							onExtract: () => {
+							onExtract: ({percent}) => {
 								completedFiles++;
+								finalPercent = percent;
 							},
 						});
 						durations.push(Number(process.hrtime.bigint() - start) / 1e6);
-						if(!finalProgress
-							|| finalProgress.filesExtracted !== files.length
-							|| finalProgress.totalFiles !== files.length
-							|| finalProgress.bytesProcessed !== expectedBytes
-							|| finalProgress.totalBytes !== expectedBytes
-							|| completedFiles !== files.length)
+						if(completedFiles !== files.length || finalPercent !== 100)
 						{
 							throw new Error(`Extraction verification failed for ${archivePath} at concurrency ${concurrency}`);
 						}
