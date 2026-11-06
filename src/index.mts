@@ -46,6 +46,7 @@ type NativeStreamCallback = (
 ) => void;
 
 type NativeFileProgressCallback = (bytesWritten: bigint) => void;
+type NativeFileCompletionCallback = (id: number, bytesWritten: bigint) => void;
 
 interface NativeFileTask {
 	readonly taskId: bigint;
@@ -55,6 +56,7 @@ interface NativeFileTask {
 interface NativeFileOutput {
 	readonly id: EntryId;
 	readonly path: string;
+	readonly overwrite: boolean;
 }
 
 const defaultMaxOutputBytes = 4n * 1024n * 1024n * 1024n;
@@ -108,6 +110,7 @@ interface NativeBinding {
 		handle: bigint,
 		outputs: readonly NativeFileOutput[],
 		progressCallback?: NativeFileProgressCallback,
+		fileCompletionCallback?: NativeFileCompletionCallback,
 	): NativeFileTask;
 	cancelExtractToFiles(taskId: bigint): void;
 	resumeStream(streamId: bigint): void;
@@ -1033,7 +1036,9 @@ export class Archive {
 		});
 		const extractGroup = async(group: readonly OutputPlan[]): Promise<void> => {
 			const outputs: NativeFileOutput[] = [];
-			const temporaryPaths: Array<string | undefined> = [];
+			let completionFailed = false;
+			let completionFailure: unknown;
+			const completedFileIds = new Set<number>();
 			try
 			{
 				for(const plan of group)
@@ -1043,26 +1048,78 @@ export class Archive {
 					if(options.overwrite)
 					{
 						await assertReplaceableOutput(plan.targetPath);
-						const temporaryPath = join(
-							dirname(plan.targetPath),
-							`.7zip-native-${randomUUID()}.tmp`,
-						);
-						temporaryPaths.push(temporaryPath);
-						outputs.push({id: plan.entry.id, path: temporaryPath});
 					}
 					else
 					{
 						await assertFolderOutputDoesNotExist(plan.targetPath);
-						temporaryPaths.push(undefined);
-						outputs.push({id: plan.entry.id, path: plan.targetPath});
 					}
+					outputs.push({
+						id: plan.entry.id,
+						path: plan.targetPath,
+						overwrite: options.overwrite === true,
+					});
 				}
 
+				const reportFileCompletions = options.onProgress !== undefined
+					|| options.onExtract !== undefined;
+				const outputIndices = new Map(outputs.map((output, index) => [output.id, index]));
+				let onFileCompleted: NativeFileCompletionCallback | undefined;
+				if(reportFileCompletions)
+				{
+					onFileCompleted = (id, bytesWritten) => {
+						if(completionFailed || hasFailure)
+						{
+							return;
+						}
+						try
+						{
+							const index = outputIndices.get(id);
+							if(index === undefined || completedFileIds.has(id))
+							{
+								throw new ArchiveError(
+									'ERR_ARCHIVE_EXTRACT',
+									'Native folder extraction returned an invalid file completion',
+								);
+							}
+							completedFileIds.add(id);
+							const plan = group[index]!;
+							if(reportBytesWritten === undefined)
+							{
+								extractedBytes += bytesWritten;
+							}
+							extractionSignal.throwIfAborted();
+							filesExtracted++;
+							reportProgress();
+							options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
+						}
+						catch (error)
+						{
+							completionFailed = true;
+							completionFailure = error;
+							stop(error);
+						}
+					};
+				}
 				const bytesWritten = await this.extractEntriesToFiles(
 					outputs,
 					extractionSignal,
 					reportBytesWritten,
+					onFileCompleted,
 				);
+				if(onFileCompleted)
+				{
+					if(completionFailed)
+					{
+						throw completionFailure;
+					}
+					if(completedFileIds.size !== group.length)
+					{
+						throw new ArchiveError(
+							'ERR_ARCHIVE_EXTRACT',
+							'Native folder extraction returned an incomplete file completion list',
+						);
+					}
+				}
 				if(bytesWritten.length !== group.length)
 				{
 					throw new ArchiveError(
@@ -1070,33 +1127,25 @@ export class Archive {
 						'Native folder extraction returned an incomplete result',
 					);
 				}
-				for(let index = 0; index < group.length; index++)
+				if(!onFileCompleted)
 				{
-					const plan = group[index]!;
-					const temporaryPath = temporaryPaths[index];
-					if(reportBytesWritten === undefined)
+					for(let index = 0; index < group.length; index++)
 					{
-						extractedBytes += bytesWritten[index]!;
-					}
-					extractionSignal.throwIfAborted();
-					if(temporaryPath)
-					{
-						await assertReplaceableOutput(plan.targetPath);
+						const plan = group[index]!;
+						if(reportBytesWritten === undefined)
+						{
+							extractedBytes += bytesWritten[index]!;
+						}
 						extractionSignal.throwIfAborted();
-						await rename(temporaryPath, plan.targetPath);
-						temporaryPaths[index] = undefined;
+						filesExtracted++;
+						reportProgress();
+						options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
 					}
-					filesExtracted++;
-					reportProgress();
-					options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
 				}
 			}
-			catch (error)
+			catch (caughtError)
 			{
-				await Promise.all(temporaryPaths
-					.filter((temporaryPath): temporaryPath is string => temporaryPath !== undefined)
-					.map(temporaryPath => rm(temporaryPath, {force: true})));
-				throw error;
+				throw completionFailed ? completionFailure : caughtError;
 			}
 		};
 
@@ -1232,6 +1281,7 @@ export class Archive {
 		outputs: readonly NativeFileOutput[],
 		signal: AbortSignal,
 		onBytesWritten?: NativeFileProgressCallback,
+		onFileCompleted?: NativeFileCompletionCallback,
 	): Promise<bigint[]> {
 		let task: NativeFileTask | undefined;
 		const cancelTask = (): void => {
@@ -1247,6 +1297,7 @@ export class Archive {
 				this.handle,
 				outputs,
 				onBytesWritten,
+				onFileCompleted,
 			);
 			signal.addEventListener('abort', cancelTask, {once: true});
 			if(signal.aborted)

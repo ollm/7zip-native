@@ -220,9 +220,9 @@ function parseArguments(args)
 		.split(',')
 		.map(value => Number(value)))];
 	if(parallelCounts.length === 0
-		|| parallelCounts.some(value => !Number.isSafeInteger(value) || value < 1 || value > 4))
+		|| parallelCounts.some(value => !Number.isSafeInteger(value) || value < 1 || value > 32))
 	{
-		throw new RangeError('--parallel-counts must contain integers between 1 and 4');
+		throw new RangeError('--parallel-counts must contain integers between 1 and 32');
 	}
 	const iterations = Number(values.get('iterations') ?? 3);
 	if(!Number.isSafeInteger(iterations) || iterations < 1 || iterations > 20)

@@ -116,6 +116,7 @@ function stubNativeFileBatchExtraction(
 		outputs: readonly {id: number; path: string}[],
 		signal: AbortSignal,
 		onBytesWritten?: (bytesWritten: bigint) => void,
+		onFileCompleted?: (id: number, bytesWritten: bigint) => void,
 	) => Promise<bigint[]>,
 ): void
 {
@@ -514,14 +515,47 @@ test('calls onExtract once per file after final output is ready', async () => {
 		assert.deepEqual(extracted.map(result => ({
 			path: result.entry.path,
 			outputPath: result.outputPath,
-		})), [
-			{path: 'chapter/cover.jpg', outputPath: coverPath},
+		})).sort((left, right) => left.path.localeCompare(right.path)), [
 			{path: 'empty.txt', outputPath: emptyPath},
-		]);
+			{path: 'chapter/cover.jpg', outputPath: coverPath},
+		].sort((left, right) => left.path.localeCompare(right.path)));
 	}
 	finally
 	{
 		await archive.close();
+	}
+});
+
+test('waits for all file completion callbacks across concurrent archive instances', async () => {
+	const paths = Array.from({length: 48}, (_, index) => ({
+		name: `files/${index}.txt`,
+		data: `file ${index}`,
+	}));
+	const localArchivePath = join(directory, 'concurrent-folder-callbacks.zip');
+	await writeFile(localArchivePath, makeStoredZip(paths));
+	const previousConcurrency = Archive.concurrency();
+	const archives = await Promise.all(Array.from({length: 4}, () => Archive.open(localArchivePath)));
+	const entries = await archives[0]!.entries();
+	const expectedIds = entries.filter(entry => !entry.isDirectory).map(entry => entry.id).sort((a, b) => a - b);
+	try
+	{
+		Archive.concurrency(4);
+		for(let iteration = 0; iteration < 4; iteration++)
+		{
+			await Promise.all(archives.map(async (archive, index) => {
+				const completedIds: number[] = [];
+				await archive.extractToFolder(join(directory, `concurrent-callbacks-${iteration}-${index}`), {
+					concurrency: 1,
+					onExtract: ({entry}) => completedIds.push(entry.id),
+				});
+				assert.deepEqual(completedIds.sort((a, b) => a - b), expectedIds);
+			}));
+		}
+	}
+	finally
+	{
+		Archive.concurrency(previousConcurrency);
+		await Promise.all(archives.map(archive => archive.close()));
 	}
 });
 
@@ -727,7 +761,13 @@ test('bounds folder extraction concurrency and reports completion out of order',
 	try
 	{
 		Archive.concurrency(4);
-		stubNativeFileBatchExtraction(archive, async (outputs, signal, onBytesWritten) => {
+		let slowCompletedBeforeGroupFinished = false;
+		stubNativeFileBatchExtraction(archive, async (
+			outputs,
+			signal,
+			onBytesWritten,
+			onFileCompleted,
+		) => {
 			active++;
 			maximumActive = Math.max(maximumActive, active);
 			try
@@ -761,6 +801,12 @@ test('bounds folder extraction concurrency and reports completion out of order',
 					}
 					await writeFile(output.path, contents);
 					bytesWritten.push(BigInt(contents.length));
+					onFileCompleted?.(output.id, BigInt(contents.length));
+					if(entry.path === 'slow.txt')
+					{
+						await delay(20, undefined, {signal});
+						slowCompletedBeforeGroupFinished = completions.includes('slow.txt');
+					}
 				}
 				return bytesWritten;
 			}
@@ -781,6 +827,7 @@ test('bounds folder extraction concurrency and reports completion out of order',
 		assert.equal(maximumActive, 2);
 		assert.equal(active, 0);
 		assert.deepEqual(completions, ['fast.txt', 'slow.txt', 'middle.txt']);
+		assert.equal(slowCompletedBeforeGroupFinished, true);
 		assert.ok(progress.some(update => update.filesExtracted === 0 && update.bytesProcessed === 7n));
 		assert.deepEqual(progress.at(-1), {filesExtracted: 3, bytesProcessed: 13n});
 		assert.equal(Archive.concurrency(), 4);
@@ -816,7 +863,7 @@ test('bounds folder extraction concurrency and reports completion out of order',
 	}
 });
 
-test('stops scheduling on extraction failure and removes overwrite temporaries', async () => {
+test('stops scheduling on extraction failure', async () => {
 	const localArchivePath = join(directory, 'failed-concurrent-folder.zip');
 	const destination = join(directory, 'failed-concurrent-folder-output');
 	await writeFile(localArchivePath, makeStoredZip([
@@ -888,7 +935,7 @@ test('stops scheduling on extraction failure and removes overwrite temporaries',
 	}
 });
 
-test('cancels active folder extractions before rejecting and removes overwrite temporaries', async () => {
+test('cancels active folder extractions before rejecting', async () => {
 	const localArchivePath = join(directory, 'cancelled-concurrent-folder.zip');
 	const destination = join(directory, 'cancelled-concurrent-folder-output');
 	await writeFile(localArchivePath, makeStoredZip([
@@ -970,7 +1017,7 @@ test('cancels active folder extractions before rejecting and removes overwrite t
 	}
 });
 
-test('cancels native file writes and preserves overwritten outputs', async () => {
+test('cancels native file writes and removes incomplete overwritten outputs', async () => {
 	const localArchivePath = join(directory, 'cancelled-native-folder.zip');
 	const destination = join(directory, 'cancelled-native-folder-output');
 	const outputPath = join(destination, 'large.bin');
@@ -998,8 +1045,8 @@ test('cancels native file writes and preserves overwritten outputs', async () =>
 			}),
 			/cancelled native file write/,
 		);
-		assert.deepEqual(await readFile(outputPath), previousOutput);
-		assert.deepEqual(await readdir(destination), ['large.bin']);
+		await assert.rejects(readFile(outputPath), {code: 'ENOENT'});
+		assert.deepEqual(await readdir(destination), []);
 	}
 	finally
 	{

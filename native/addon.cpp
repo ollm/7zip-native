@@ -223,6 +223,35 @@ struct StreamMessage {
 
 void StreamMessageToJs(Napi::Env env, Napi::Function callback, StreamMessage *message);
 void FileProgressToJs(Napi::Env env, Napi::Function callback, std::uint64_t *byteCount);
+class FileCompletionAcknowledgement {
+public:
+	void Acknowledge()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			acknowledged_ = true;
+		}
+		completed_.notify_one();
+	}
+
+	void Wait()
+	{
+		std::unique_lock<std::mutex> lock(mutex_);
+		completed_.wait(lock, [this] { return acknowledged_; });
+	}
+
+private:
+	std::mutex mutex_;
+	std::condition_variable completed_;
+	bool acknowledged_ = false;
+};
+
+struct FileCompletionMessage {
+	std::uint32_t entryId;
+	std::uint64_t bytesWritten;
+	std::shared_ptr<FileCompletionAcknowledgement> acknowledgement;
+};
+void FileCompletionToJs(Napi::Env env, Napi::Function callback, FileCompletionMessage *message);
 
 class NativeStreamState {
 public:
@@ -319,21 +348,45 @@ public:
 		return !IsCancelled();
 	}
 
+	bool ReportFileCompleted(std::uint32_t entryId, std::uint64_t bytesWritten)
+	{
+		if (!hasFileCompletionCallback_) {
+			return !IsCancelled();
+		}
+		auto acknowledgement = std::make_shared<FileCompletionAcknowledgement>();
+		auto *message = new FileCompletionMessage{entryId, bytesWritten, acknowledgement};
+		const auto status = fileCompletionCallback.BlockingCall(message, FileCompletionToJs);
+		if (status != napi_ok) {
+			delete message;
+			Cancel();
+			return false;
+		}
+		acknowledgement->Wait();
+		return !IsCancelled();
+	}
+
 	void ReleaseCallback()
 	{
 		if (hasProgressCallback_
-			&& !callbackReleased_.exchange(true, std::memory_order_acq_rel)) {
+			&& !progressCallbackReleased_.exchange(true, std::memory_order_acq_rel)) {
 			progressCallback.Release();
+		}
+		if (hasFileCompletionCallback_
+			&& !fileCompletionCallbackReleased_.exchange(true, std::memory_order_acq_rel)) {
+			fileCompletionCallback.Release();
 		}
 	}
 
 	std::uint64_t id = 0;
 	Napi::ThreadSafeFunction progressCallback;
+	Napi::ThreadSafeFunction fileCompletionCallback;
 	bool hasProgressCallback_ = false;
+	bool hasFileCompletionCallback_ = false;
 
 private:
 	std::atomic<bool> cancelled_{false};
-	std::atomic<bool> callbackReleased_{false};
+	std::atomic<bool> progressCallbackReleased_{false};
+	std::atomic<bool> fileCompletionCallbackReleased_{false};
 };
 
 std::uint64_t RegisterStream(std::shared_ptr<NativeStreamState> stream)
@@ -1428,18 +1481,26 @@ public:
 	NativeFileOutStream(
 		std::string path,
 		std::uint64_t expectedSize,
-		std::shared_ptr<NativeFileTaskState> task)
+		std::shared_ptr<NativeFileTaskState> task,
+		bool overwrite)
 		: path_(std::move(path)),
 			expectedSize_(expectedSize),
-			task_(std::move(task)) {}
+			task_(std::move(task)),
+			overwrite_(overwrite) {}
 
 	~NativeFileOutStream()
 	{
 		Close();
+		if (fileCreated_ && !completed_) {
+			RemoveOutputFile();
+		}
 	}
 
 	bool Open()
 	{
+		if (overwrite_ && !RemoveOutputFile()) {
+			return false;
+		}
 #ifdef _WIN32
 		const auto nativePath = NativePath(path_);
 		fileDescriptor_ = ::_wopen(
@@ -1461,6 +1522,7 @@ public:
 			SetError("Unable to create extraction output file");
 			return false;
 		}
+		fileCreated_ = true;
 		return true;
 	}
 
@@ -1480,6 +1542,11 @@ public:
 			return false;
 		}
 		return true;
+	}
+
+	void MarkCompleted()
+	{
+		completed_ = true;
 	}
 
 	std::uint64_t BytesWritten() const
@@ -1503,10 +1570,28 @@ private:
 		error_ = std::string(message) + ": " + std::strerror(errno);
 	}
 
+	bool RemoveOutputFile()
+	{
+		const auto nativePath = NativePath(path_);
+#ifdef _WIN32
+		const auto result = ::_wunlink(nativePath.c_str());
+#else
+		const auto result = ::unlink(nativePath.c_str());
+#endif
+		if (result == 0 || errno == ENOENT) {
+			return true;
+		}
+		SetError("Unable to remove extraction output file");
+		return false;
+	}
+
 	std::string path_;
 	int fileDescriptor_ = -1;
 	std::uint64_t expectedSize_;
 	std::shared_ptr<NativeFileTaskState> task_;
+	bool overwrite_;
+	bool fileCreated_ = false;
+	bool completed_ = false;
 	std::uint64_t bytesWritten_ = 0;
 	bool sizeLimitExceeded_ = false;
 	std::string error_;
@@ -1572,10 +1657,17 @@ Z7_COM7F_IMF(NativeFileOutStream::Write(
 	return S_OK;
 }
 
+struct NativeFileOutputSpec {
+	std::uint32_t id = 0;
+	std::string path;
+	bool overwrite = false;
+};
+
 struct FileOutputRequest {
 	std::uint32_t id = 0;
 	std::string path;
 	std::uint64_t expectedSize = 0;
+	bool overwrite = false;
 	std::int32_t operationResult = NArchive::NExtract::NOperationResult::kUnavailable;
 	NativeFileOutStream *stream = nullptr;
 	std::string error;
@@ -1650,7 +1742,8 @@ Z7_COM7F_IMF(BatchFileExtractCallback::GetStream(
 	}
 	auto& request = requests_[found->second];
 	currentRequest_ = &request;
-	auto *fileStream = new NativeFileOutStream(request.path, request.expectedSize, task_);
+	auto *fileStream = new NativeFileOutStream(
+		request.path, request.expectedSize, task_, request.overwrite);
 	CMyComPtr<ISequentialOutStream> output = fileStream;
 	if (!fileStream->Open()) {
 		request.error = fileStream->Error();
@@ -1674,6 +1767,17 @@ Z7_COM7F_IMF(BatchFileExtractCallback::SetOperationResult(Int32 operationResult)
 		currentRequest_->operationResult = operationResult;
 		if (currentRequest_->stream != nullptr && !currentRequest_->stream->Close()) {
 			currentRequest_->error = currentRequest_->stream->Error();
+		}
+		if (operationResult == NArchive::NExtract::NOperationResult::kOK
+			&& currentRequest_->stream != nullptr
+			&& currentRequest_->error.empty()
+			&& !currentRequest_->stream->SizeLimitExceeded()) {
+			currentRequest_->stream->MarkCompleted();
+			if (!task_->ReportFileCompleted(
+					currentRequest_->id,
+					currentRequest_->stream->BytesWritten())) {
+				return E_ABORT;
+			}
 		}
 	}
 	return S_OK;
@@ -2121,7 +2225,7 @@ public:
 	}
 
 	std::vector<std::uint64_t> ExtractToFiles(
-		const std::vector<std::pair<std::uint32_t, std::string>>& outputs,
+		const std::vector<NativeFileOutputSpec>& outputs,
 		const std::shared_ptr<NativeFileTaskState>& task)
 	{
 		if (contexts_.empty()) {
@@ -2140,7 +2244,9 @@ public:
 		requestById.reserve(outputs.size());
 		std::vector<UInt32> sortedIds;
 		sortedIds.reserve(outputs.size());
-		for (const auto& [id, path] : outputs) {
+		for (const auto& output : outputs) {
+			const auto id = output.id;
+			const auto& path = output.path;
 			if (id >= entries_.size()) {
 				throw std::out_of_range("Entry ID is out of range");
 			}
@@ -2157,6 +2263,7 @@ public:
 				id,
 				path,
 				entries_[id].size,
+				output.overwrite,
 				NArchive::NExtract::NOperationResult::kUnavailable,
 				nullptr,
 				{},
@@ -2406,6 +2513,21 @@ void FileProgressToJs(Napi::Env env, Napi::Function callback, std::uint64_t *byt
 	if (env != nullptr && callback) {
 		callback.Call({Napi::BigInt::New(env, *byteCount)});
 	}
+}
+
+void FileCompletionToJs(
+	Napi::Env env,
+	Napi::Function callback,
+	FileCompletionMessage *message)
+{
+	std::unique_ptr<FileCompletionMessage> owned(message);
+	if (env != nullptr && callback) {
+		callback.Call({
+			Napi::Number::New(env, message->entryId),
+			Napi::BigInt::New(env, message->bytesWritten),
+		});
+	}
+	message->acknowledgement->Acknowledge();
 }
 
 class BoundedAsyncWorker : public Napi::AsyncWorker {
@@ -2741,7 +2863,7 @@ public:
 	ExtractToFilesWorker(
 		Napi::Promise::Deferred deferred,
 		std::shared_ptr<ArchiveEngine> archive,
-		std::vector<std::pair<std::uint32_t, std::string>> outputs,
+		std::vector<NativeFileOutputSpec> outputs,
 		std::shared_ptr<NativeFileTaskState> task)
 		: deferred_(deferred),
 			archive_(std::move(archive)),
@@ -2782,7 +2904,7 @@ public:
 private:
 	Napi::Promise::Deferred deferred_;
 	std::shared_ptr<ArchiveEngine> archive_;
-	std::vector<std::pair<std::uint32_t, std::string>> outputs_;
+	std::vector<NativeFileOutputSpec> outputs_;
 	std::shared_ptr<NativeFileTaskState> task_;
 	std::vector<std::uint64_t> bytesWritten_;
 	std::string error_;
@@ -3220,11 +3342,13 @@ Napi::Value StartStream(const Napi::CallbackInfo& info)
 Napi::Value StartExtractToFiles(const Napi::CallbackInfo& info)
 {
 	const auto env = info.Env();
-	if ((info.Length() != 2 && info.Length() != 3)
+	if (info.Length() < 2
+		|| info.Length() > 4
 		|| !info[1].IsArray()
-		|| (info.Length() == 3 && !info[2].IsUndefined() && !info[2].IsFunction())) {
+		|| (info.Length() >= 3 && !info[2].IsUndefined() && !info[2].IsFunction())
+		|| (info.Length() == 4 && !info[3].IsUndefined() && !info[3].IsFunction())) {
 		throw Napi::TypeError::New(
-			env, "startExtractToFiles(handle, files, progressCallback?) expects a handle, file list, and optional callback");
+			env, "startExtractToFiles(handle, files, progressCallback?, fileCompleteCallback?) expects a handle, file list, and optional callbacks");
 	}
 	const auto handle = GetHandle(info[0]);
 	auto archive = FindArchive(handle);
@@ -3235,7 +3359,7 @@ Napi::Value StartExtractToFiles(const Napi::CallbackInfo& info)
 	if (inputFiles.Length() > kMaxEntries) {
 		throw Napi::RangeError::New(env, "Folder extraction batch exceeds the native entry limit");
 	}
-	std::vector<std::pair<std::uint32_t, std::string>> outputs;
+	std::vector<NativeFileOutputSpec> outputs;
 	outputs.reserve(inputFiles.Length());
 	for (std::uint32_t index = 0; index < inputFiles.Length(); ++index) {
 		const auto value = inputFiles.Get(index);
@@ -3245,15 +3369,19 @@ Napi::Value StartExtractToFiles(const Napi::CallbackInfo& info)
 		const auto file = value.As<Napi::Object>();
 		std::uint64_t id = 0;
 		const auto path = file.Get("path");
+		const auto overwrite = file.Get("overwrite");
 		if (!ReadUnsigned(file.Get("id"), id)
 			|| id > std::numeric_limits<std::uint32_t>::max()
-			|| !path.IsString()) {
+			|| !path.IsString()
+			|| !overwrite.IsBoolean()) {
 			throw Napi::TypeError::New(
-				env, "Folder extraction files require a valid entry ID and output path");
+				env, "Folder extraction files require a valid entry ID, output path, and overwrite flag");
 		}
-		outputs.emplace_back(
+		outputs.push_back({
 			static_cast<std::uint32_t>(id),
-			path.As<Napi::String>().Utf8Value());
+			path.As<Napi::String>().Utf8Value(),
+			overwrite.As<Napi::Boolean>().Value(),
+		});
 	}
 	if (g_extractionPool == nullptr) {
 		throw Napi::Error::New(env, "Native extraction pool is not initialized");
@@ -3267,7 +3395,7 @@ Napi::Value StartExtractToFiles(const Napi::CallbackInfo& info)
 	std::uint64_t taskId = 0;
 	try {
 		task = std::make_shared<NativeFileTaskState>();
-		if (info.Length() == 3 && info[2].IsFunction()) {
+		if (info.Length() >= 3 && info[2].IsFunction()) {
 			task->progressCallback = Napi::ThreadSafeFunction::New(
 				env,
 				info[2].As<Napi::Function>(),
@@ -3275,6 +3403,15 @@ Napi::Value StartExtractToFiles(const Napi::CallbackInfo& info)
 				1,
 				1);
 			task->hasProgressCallback_ = true;
+		}
+		if (info.Length() == 4 && info[3].IsFunction()) {
+			task->fileCompletionCallback = Napi::ThreadSafeFunction::New(
+				env,
+				info[3].As<Napi::Function>(),
+				"7zip-native folder file completion",
+				1,
+				1);
+			task->hasFileCompletionCallback_ = true;
 		}
 		taskId = RegisterFileTask(task);
 		auto deferred = Napi::Promise::Deferred::New(env);

@@ -219,7 +219,7 @@ await archive.extractToFolder('./unpacked', {
 - `concurrency`: Maximum number of native extraction batches this call runs simultaneously. Must be an integer from 1 to 128; defaults to 1 and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`.
 - `overwrite`: Defaults to `false`, so existing files are not overwritten. When `true`, each existing regular file is replaced only after its entry has been fully extracted to a temporary file alongside the destination. A failure does not truncate the existing file, but replacement may temporarily require extra disk space up to the size of the entry.
 - `onProgress`: Called before extraction, as chunks are processed, and after each file completes. Receives `filesExtracted`, `totalFiles`, aggregated `bytesProcessed`, `totalBytes`, and the calculated `percent`.
-- `onExtract`: Called once for each regular file after it is fully written and, when overwriting, after the final replacement. Receives `{entry, outputPath}`; `entry` retains the original archive metadata and `outputPath` is the final destination path.
+- `onExtract`: Called as each regular file finishes writing and, when overwriting, after its final replacement; it does not wait for the rest of the batch. Concurrent extraction can make event order differ from selection order. Receives `{entry, outputPath}`; `entry` retains the original archive metadata and `outputPath` is the final destination path.
 - `maxBytes`: Maximum total uncompressed output size. Defaults to 4 GiB; set to `null` to disable the limit.
 - `signal`: Optional `AbortSignal`. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
 
