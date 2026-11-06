@@ -1,5 +1,5 @@
 import {existsSync} from 'node:fs';
-import {link, lstat, mkdir, open as openFile, rename, rm} from 'node:fs/promises';
+import {link, lstat, mkdir, rename, rm} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 import {createRequire} from 'node:module';
 import {availableParallelism} from 'node:os';
@@ -49,7 +49,12 @@ type NativeFileProgressCallback = (bytesWritten: bigint) => void;
 
 interface NativeFileTask {
 	readonly taskId: bigint;
-	readonly promise: Promise<bigint>;
+	readonly promise: Promise<bigint[]>;
+}
+
+interface NativeFileOutput {
+	readonly id: EntryId;
+	readonly path: string;
 }
 
 const defaultMaxOutputBytes = 4n * 1024n * 1024n * 1024n;
@@ -99,13 +104,12 @@ interface NativeBinding {
 		requests: readonly {id: number; offset: bigint; length: bigint}[],
 	): Promise<Buffer[]>;
 	startStream(handle: bigint, id: number, callback: NativeStreamCallback): bigint;
-	startExtractToFile(
+	startExtractToFiles(
 		handle: bigint,
-		id: number,
-		fileDescriptor: number,
+		outputs: readonly NativeFileOutput[],
 		progressCallback?: NativeFileProgressCallback,
 	): NativeFileTask;
-	cancelExtractToFile(taskId: bigint): void;
+	cancelExtractToFiles(taskId: bigint): void;
 	resumeStream(streamId: bigint): void;
 	cancelStream(streamId: bigint): void;
 	read(handle: bigint, id: number, offset: bigint, length: bigint): Promise<Buffer>;
@@ -298,6 +302,24 @@ async function assertReplaceableOutput(filePath: string): Promise<void>
 	catch (error)
 	{
 		if(error instanceof ArchiveError || (error as NodeJS.ErrnoException).code !== 'ENOENT')
+		{
+			throw error;
+		}
+	}
+}
+
+async function assertFolderOutputDoesNotExist(filePath: string): Promise<void>
+{
+	try
+	{
+		await lstat(filePath);
+		const error = new Error(`Output file already exists: ${filePath}`);
+		Object.assign(error, {code: 'EEXIST'});
+		throw error;
+	}
+	catch (error)
+	{
+		if((error as NodeJS.ErrnoException).code !== 'ENOENT')
 		{
 			throw error;
 		}
@@ -968,7 +990,6 @@ export class Archive {
 		const extractionSignal = controller.signal;
 		let hasFailure = false;
 		let failure: unknown;
-		let nextFileIndex = 0;
 		const stop = (error: unknown): void => {
 			if(!hasFailure)
 			{
@@ -1005,86 +1026,92 @@ export class Archive {
 			};
 		}
 
-		const extractFile = async(plan: OutputPlan): Promise<void> => {
-			await ensureOutputParents(root, plan.targetPath);
-			extractionSignal.throwIfAborted();
-			let temporaryPath: string | undefined;
-			let outputPath = plan.targetPath;
-			if(options.overwrite)
-			{
-				await assertReplaceableOutput(plan.targetPath);
-				temporaryPath = join(dirname(plan.targetPath), `.7zip-native-${randomUUID()}.tmp`);
-				outputPath = temporaryPath;
-			}
+		const groupCount = Math.min(concurrency, filePlans.length);
+		const fileGroups = Array.from({length: groupCount}, () => [] as OutputPlan[]);
+		filePlans.forEach((plan, index) => {
+			fileGroups[index % groupCount]!.push(plan);
+		});
+		const extractGroup = async(group: readonly OutputPlan[]): Promise<void> => {
+			const outputs: NativeFileOutput[] = [];
+			const temporaryPaths: Array<string | undefined> = [];
 			try
 			{
-				const bytesWritten = await this.extractEntryToFile(
-					plan.entry.id,
-					outputPath,
+				for(const plan of group)
+				{
+					await ensureOutputParents(root, plan.targetPath);
+					extractionSignal.throwIfAborted();
+					if(options.overwrite)
+					{
+						await assertReplaceableOutput(plan.targetPath);
+						const temporaryPath = join(
+							dirname(plan.targetPath),
+							`.7zip-native-${randomUUID()}.tmp`,
+						);
+						temporaryPaths.push(temporaryPath);
+						outputs.push({id: plan.entry.id, path: temporaryPath});
+					}
+					else
+					{
+						await assertFolderOutputDoesNotExist(plan.targetPath);
+						temporaryPaths.push(undefined);
+						outputs.push({id: plan.entry.id, path: plan.targetPath});
+					}
+				}
+
+				const bytesWritten = await this.extractEntriesToFiles(
+					outputs,
 					extractionSignal,
 					reportBytesWritten,
 				);
-				if(reportBytesWritten === undefined)
+				if(bytesWritten.length !== group.length)
 				{
-					extractedBytes += bytesWritten;
+					throw new ArchiveError(
+						'ERR_ARCHIVE_EXTRACT',
+						'Native folder extraction returned an incomplete result',
+					);
 				}
-				extractionSignal.throwIfAborted();
-				if(temporaryPath)
+				for(let index = 0; index < group.length; index++)
 				{
-					await assertReplaceableOutput(plan.targetPath);
+					const plan = group[index]!;
+					const temporaryPath = temporaryPaths[index];
+					if(reportBytesWritten === undefined)
+					{
+						extractedBytes += bytesWritten[index]!;
+					}
 					extractionSignal.throwIfAborted();
-					await rename(temporaryPath, plan.targetPath);
-					temporaryPath = undefined;
+					if(temporaryPath)
+					{
+						await assertReplaceableOutput(plan.targetPath);
+						extractionSignal.throwIfAborted();
+						await rename(temporaryPath, plan.targetPath);
+						temporaryPaths[index] = undefined;
+					}
+					filesExtracted++;
+					reportProgress();
+					options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
 				}
-				filesExtracted++;
-				reportProgress();
-				options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
 			}
 			catch (error)
 			{
-				if(temporaryPath)
-				{
-					await rm(temporaryPath, {force: true});
-				}
+				await Promise.all(temporaryPaths
+					.filter((temporaryPath): temporaryPath is string => temporaryPath !== undefined)
+					.map(temporaryPath => rm(temporaryPath, {force: true})));
 				throw error;
-			}
-		};
-
-		const runWorker = async(): Promise<void> => {
-			while(!hasFailure)
-			{
-				if(options.signal?.aborted)
-				{
-					stop(options.signal.reason);
-					return;
-				}
-				const plan = filePlans[nextFileIndex++];
-				if(!plan)
-				{
-					return;
-				}
-				try
-				{
-					await extractFile(plan);
-				}
-				catch (error)
-				{
-					stop(error);
-					return;
-				}
 			}
 		};
 
 		try
 		{
 			options.signal?.throwIfAborted();
-			const workers = Array.from(
-				{length: Math.min(concurrency, filePlans.length)},
-				() => runWorker(),
-			);
-			await Promise.all(workers);
-			if(hasFailure)
+			const workers = fileGroups.map(group => extractGroup(group));
+			try
 			{
+				await Promise.all(workers);
+			}
+			catch (error)
+			{
+				stop(error);
+				await Promise.allSettled(workers);
 				throw failure;
 			}
 		}
@@ -1201,27 +1228,24 @@ export class Archive {
 		}
 	}
 
-	private async extractEntryToFile(
-		id: EntryId,
-		outputPath: string,
+	private async extractEntriesToFiles(
+		outputs: readonly NativeFileOutput[],
 		signal: AbortSignal,
 		onBytesWritten?: NativeFileProgressCallback,
-	): Promise<bigint> {
-		const fileHandle = await openFile(outputPath, 'wx', 0o600);
+	): Promise<bigint[]> {
 		let task: NativeFileTask | undefined;
 		const cancelTask = (): void => {
 			if(task)
 			{
-				native.cancelExtractToFile(task.taskId);
+				native.cancelExtractToFiles(task.taskId);
 			}
 		};
 		try
 		{
 			signal.throwIfAborted();
-			task = native.startExtractToFile(
+			task = native.startExtractToFiles(
 				this.handle,
-				id,
-				fileHandle.fd,
+				outputs,
 				onBytesWritten,
 			);
 			signal.addEventListener('abort', cancelTask, {once: true});
@@ -1242,7 +1266,6 @@ export class Archive {
 		finally
 		{
 			signal.removeEventListener('abort', cancelTask);
-			await fileHandle.close();
 		}
 	}
 

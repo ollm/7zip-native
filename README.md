@@ -216,14 +216,14 @@ await archive.extractToFolder('./unpacked', {
 
 - `ids`: Entry IDs to extract. Omit both `ids` and `paths` to extract every entry.
 - `paths`: Exact, original archive paths to extract, using `/` separators. This cannot be combined with `ids`.
-- `concurrency`: Maximum number of files this call extracts simultaneously. Must be an integer from 1 to 128; defaults to 1 and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`.
+- `concurrency`: Maximum number of native extraction batches this call runs simultaneously. Must be an integer from 1 to 128; defaults to 1 and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`.
 - `overwrite`: Defaults to `false`, so existing files are not overwritten. When `true`, each existing regular file is replaced only after its entry has been fully extracted to a temporary file alongside the destination. A failure does not truncate the existing file, but replacement may temporarily require extra disk space up to the size of the entry.
 - `onProgress`: Called before extraction, as chunks are processed, and after each file completes. Receives `filesExtracted`, `totalFiles`, aggregated `bytesProcessed`, `totalBytes`, and the calculated `percent`.
 - `onExtract`: Called once for each regular file after it is fully written and, when overwriting, after the final replacement. Receives `{entry, outputPath}`; `entry` retains the original archive metadata and `outputPath` is the final destination path.
 - `maxBytes`: Maximum total uncompressed output size. Defaults to 4 GiB; set to `null` to disable the limit.
 - `signal`: Optional `AbortSignal`. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
 
-The 7-Zip native worker writes extracted bytes directly to the destination file descriptor; file contents are not streamed through Node.js or Electron. The JavaScript layer still validates paths, creates output files securely, reports progress, and performs atomic replacement when `overwrite` is enabled.
+Each native extraction call receives a batch of entry IDs and output paths, then writes the extracted bytes directly to disk; file contents are not streamed through Node.js or Electron. The JavaScript layer validates paths, prepares destination directories, reports progress, and performs atomic replacement when `overwrite` is enabled.
 
 On Windows only, invalid filename characters (`< > : | ? * "`) and trailing dots/spaces in each destination component are replaced with `_`; selectors and entry metadata remain unchanged. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 

@@ -31,10 +31,12 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <cerrno>
+#include <fcntl.h>
 #include <unistd.h>
 #else
 #include <fcntl.h>
 #include <io.h>
+#include <sys/stat.h>
 #endif
 
 #include "Common/MyInitGuid.h"
@@ -1418,18 +1420,67 @@ Z7_COM7F_IMF(StreamingExtractCallback::CryptoGetTextPassword(BSTR *password))
 	return GetPasswordBstr(password_, password);
 }
 
-class FileDescriptorOutStream final : public ISequentialOutStream, public CMyUnknownImp {
+class NativeFileOutStream final : public ISequentialOutStream, public CMyUnknownImp {
 	Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
 	Z7_COM7F_IMP(Write(const void *data, UInt32 size, UInt32 *processedSize))
 
 public:
-	FileDescriptorOutStream(
-		int fileDescriptor,
+	NativeFileOutStream(
+		std::string path,
 		std::uint64_t expectedSize,
 		std::shared_ptr<NativeFileTaskState> task)
-		: fileDescriptor_(fileDescriptor),
+		: path_(std::move(path)),
 			expectedSize_(expectedSize),
 			task_(std::move(task)) {}
+
+	~NativeFileOutStream()
+	{
+		Close();
+	}
+
+	bool Open()
+	{
+#ifdef _WIN32
+		const auto nativePath = NativePath(path_);
+		fileDescriptor_ = ::_wopen(
+			nativePath.c_str(),
+			_O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+			_S_IREAD | _S_IWRITE);
+#else
+		const auto nativePath = NativePath(path_);
+		int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+		flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+		flags |= O_NOFOLLOW;
+#endif
+		fileDescriptor_ = ::open(nativePath.c_str(), flags, 0600);
+#endif
+		if (fileDescriptor_ < 0) {
+			SetError("Unable to create extraction output file");
+			return false;
+		}
+		return true;
+	}
+
+	bool Close()
+	{
+		if (fileDescriptor_ < 0) {
+			return error_.empty();
+		}
+#ifdef _WIN32
+		const auto result = ::_close(fileDescriptor_);
+#else
+		const auto result = ::close(fileDescriptor_);
+#endif
+		fileDescriptor_ = -1;
+		if (result != 0) {
+			SetError("Unable to close extraction output file");
+			return false;
+		}
+		return true;
+	}
 
 	std::uint64_t BytesWritten() const
 	{
@@ -1441,15 +1492,27 @@ public:
 		return sizeLimitExceeded_;
 	}
 
+	const std::string& Error() const
+	{
+		return error_;
+	}
+
 private:
-	int fileDescriptor_;
+	void SetError(const char *message)
+	{
+		error_ = std::string(message) + ": " + std::strerror(errno);
+	}
+
+	std::string path_;
+	int fileDescriptor_ = -1;
 	std::uint64_t expectedSize_;
 	std::shared_ptr<NativeFileTaskState> task_;
 	std::uint64_t bytesWritten_ = 0;
 	bool sizeLimitExceeded_ = false;
+	std::string error_;
 };
 
-Z7_COM7F_IMF(FileDescriptorOutStream::Write(
+Z7_COM7F_IMF(NativeFileOutStream::Write(
 	const void *data, UInt32 size, UInt32 *processedSize))
 {
 	if (processedSize != nullptr) {
@@ -1509,7 +1572,16 @@ Z7_COM7F_IMF(FileDescriptorOutStream::Write(
 	return S_OK;
 }
 
-class FileExtractCallback final :
+struct FileOutputRequest {
+	std::uint32_t id = 0;
+	std::string path;
+	std::uint64_t expectedSize = 0;
+	std::int32_t operationResult = NArchive::NExtract::NOperationResult::kUnavailable;
+	NativeFileOutStream *stream = nullptr;
+	std::string error;
+};
+
+class BatchFileExtractCallback final :
 	public IArchiveExtractCallback,
 	public ICryptoGetTextPassword,
 	public CMyUnknownImp {
@@ -1524,93 +1596,90 @@ class FileExtractCallback final :
 	Z7_IFACE_COM7_IMP(ICryptoGetTextPassword)
 
 public:
-	FileExtractCallback(
-		std::uint32_t id,
-		std::uint64_t expectedSize,
-		int fileDescriptor,
+	BatchFileExtractCallback(
+		std::vector<FileOutputRequest>& requests,
+		const std::unordered_map<std::uint32_t, std::size_t>& requestById,
 		std::shared_ptr<NativeFileTaskState> task,
 		const std::optional<std::string>& password)
-		: id_(id),
-			expectedSize_(expectedSize),
-			fileDescriptor_(fileDescriptor),
+		: requests_(requests),
+			requestById_(requestById),
 			task_(std::move(task)),
 			password_(password),
-			operationResult_(NArchive::NExtract::NOperationResult::kUnavailable),
+			currentRequest_(nullptr),
 			passwordRequested_(false) {}
-
-	std::int32_t OperationResult() const
-	{
-		return operationResult_;
-	}
 
 	bool PasswordRequested() const
 	{
 		return passwordRequested_.load(std::memory_order_acquire);
 	}
 
-	std::uint64_t BytesWritten() const
-	{
-		return outputDetails_ != nullptr ? outputDetails_->BytesWritten() : 0;
-	}
-
-	bool SizeLimitExceeded() const
-	{
-		return outputDetails_ != nullptr && outputDetails_->SizeLimitExceeded();
-	}
-
 private:
-	std::uint32_t id_;
-	std::uint64_t expectedSize_;
-	int fileDescriptor_;
+	std::vector<FileOutputRequest>& requests_;
+	const std::unordered_map<std::uint32_t, std::size_t>& requestById_;
 	std::shared_ptr<NativeFileTaskState> task_;
 	const std::optional<std::string>& password_;
-	std::int32_t operationResult_;
+	FileOutputRequest *currentRequest_;
 	std::atomic<bool> passwordRequested_;
-	CMyComPtr<ISequentialOutStream> outputStream_;
-	FileDescriptorOutStream *outputDetails_ = nullptr;
+	std::vector<CMyComPtr<ISequentialOutStream>> streams_;
 };
 
-Z7_COM7F_IMF(FileExtractCallback::SetTotal(UInt64))
+Z7_COM7F_IMF(BatchFileExtractCallback::SetTotal(UInt64))
 {
 	return S_OK;
 }
 
-Z7_COM7F_IMF(FileExtractCallback::SetCompleted(const UInt64 *))
+Z7_COM7F_IMF(BatchFileExtractCallback::SetCompleted(const UInt64 *))
 {
 	return task_->IsCancelled() ? E_ABORT : S_OK;
 }
 
-Z7_COM7F_IMF(FileExtractCallback::GetStream(
+Z7_COM7F_IMF(BatchFileExtractCallback::GetStream(
 	UInt32 index, ISequentialOutStream **outStream, Int32 askExtractMode))
 {
 	*outStream = nullptr;
+	currentRequest_ = nullptr;
 	if (task_->IsCancelled()) {
 		return E_ABORT;
 	}
-	if (askExtractMode != NArchive::NExtract::NAskMode::kExtract || index != id_) {
+	if (askExtractMode != NArchive::NExtract::NAskMode::kExtract) {
 		return S_OK;
 	}
-	auto *fileStream = new FileDescriptorOutStream(
-		fileDescriptor_, expectedSize_, task_);
-	outputDetails_ = fileStream;
-	outputStream_ = fileStream;
-	*outStream = outputStream_;
+	const auto found = requestById_.find(index);
+	if (found == requestById_.end()) {
+		return S_OK;
+	}
+	auto& request = requests_[found->second];
+	currentRequest_ = &request;
+	auto *fileStream = new NativeFileOutStream(request.path, request.expectedSize, task_);
+	CMyComPtr<ISequentialOutStream> output = fileStream;
+	if (!fileStream->Open()) {
+		request.error = fileStream->Error();
+		return E_FAIL;
+	}
+	request.stream = fileStream;
+	streams_.push_back(output);
+	*outStream = output;
 	(*outStream)->AddRef();
 	return S_OK;
 }
 
-Z7_COM7F_IMF(FileExtractCallback::PrepareOperation(Int32))
+Z7_COM7F_IMF(BatchFileExtractCallback::PrepareOperation(Int32))
 {
 	return task_->IsCancelled() ? E_ABORT : S_OK;
 }
 
-Z7_COM7F_IMF(FileExtractCallback::SetOperationResult(Int32 operationResult))
+Z7_COM7F_IMF(BatchFileExtractCallback::SetOperationResult(Int32 operationResult))
 {
-	operationResult_ = operationResult;
+	if (currentRequest_ != nullptr) {
+		currentRequest_->operationResult = operationResult;
+		if (currentRequest_->stream != nullptr && !currentRequest_->stream->Close()) {
+			currentRequest_->error = currentRequest_->stream->Error();
+		}
+	}
 	return S_OK;
 }
 
-Z7_COM7F_IMF(FileExtractCallback::CryptoGetTextPassword(BSTR *password))
+Z7_COM7F_IMF(BatchFileExtractCallback::CryptoGetTextPassword(BSTR *password))
 {
 	passwordRequested_.store(true, std::memory_order_release);
 	return GetPasswordBstr(password_, password);
@@ -2051,62 +2120,99 @@ public:
 		}
 	}
 
-	std::uint64_t ExtractToFile(
-		std::uint32_t id,
-		int fileDescriptor,
+	std::vector<std::uint64_t> ExtractToFiles(
+		const std::vector<std::pair<std::uint32_t, std::string>>& outputs,
 		const std::shared_ptr<NativeFileTaskState>& task)
 	{
 		if (contexts_.empty()) {
 			throw std::runtime_error("Archive is closed");
 		}
-		if (id >= entries_.size()) {
-			throw std::out_of_range("Entry ID is out of range");
-		}
-		if (entries_[id].directory) {
-			throw std::invalid_argument("Cannot extract a directory entry to a file");
-		}
 		if (task->IsCancelled()) {
-			throw std::runtime_error("Native file extraction was cancelled");
+			throw std::runtime_error("Native folder extraction was cancelled");
+		}
+		if (outputs.empty()) {
+			return {};
 		}
 
+		std::vector<FileOutputRequest> requests;
+		requests.reserve(outputs.size());
+		std::unordered_map<std::uint32_t, std::size_t> requestById;
+		requestById.reserve(outputs.size());
+		std::vector<UInt32> sortedIds;
+		sortedIds.reserve(outputs.size());
+		for (const auto& [id, path] : outputs) {
+			if (id >= entries_.size()) {
+				throw std::out_of_range("Entry ID is out of range");
+			}
+			if (entries_[id].directory) {
+				throw std::invalid_argument("Cannot extract a directory entry to a file");
+			}
+			if (path.empty() || path.find('\0') != std::string::npos) {
+				throw std::invalid_argument("Extraction output paths must be non-empty and contain no null bytes");
+			}
+			if (!requestById.emplace(id, requests.size()).second) {
+				throw std::invalid_argument("Duplicate entry IDs are not allowed in a folder extraction batch");
+			}
+			requests.push_back({
+				id,
+				path,
+				entries_[id].size,
+				NArchive::NExtract::NOperationResult::kUnavailable,
+				nullptr,
+				{},
+			});
+			sortedIds.push_back(id);
+		}
+		std::sort(sortedIds.begin(), sortedIds.end());
+
 		auto context = AcquireContext();
-		auto *extractCallbackObject = new FileExtractCallback(
-			id,
-			entries_[id].size,
-			fileDescriptor,
-			task,
-			password_);
+		auto *extractCallbackObject = new BatchFileExtractCallback(
+			requests, requestById, task, password_);
 		CMyComPtr<IArchiveExtractCallback> callback = extractCallbackObject;
-		const UInt32 itemIndex = id;
 		if (g_setDeflateInputBufferSize(deflateBufferSize_) != S_OK) {
 			throw std::runtime_error("Unable to configure the Deflate input buffer");
 		}
-		const auto result = context->archive->Extract(&itemIndex, 1, 0, callback);
+		const auto result = context->archive->Extract(
+			sortedIds.data(),
+			static_cast<UInt32>(sortedIds.size()),
+			0,
+			callback);
 		if (task->IsCancelled()) {
-			throw std::runtime_error("Native file extraction was cancelled");
+			throw std::runtime_error("Native folder extraction was cancelled");
 		}
-		if (extractCallbackObject->SizeLimitExceeded()) {
-			throw std::runtime_error("Extracted entry exceeds its declared size");
+		for (const auto& request : requests) {
+			if (!request.error.empty()) {
+				throw std::runtime_error(request.error);
+			}
+			if (request.stream != nullptr && request.stream->SizeLimitExceeded()) {
+				throw std::runtime_error(
+					"Extracted entry exceeds its declared size: " + request.path);
+			}
 		}
 		if (result != S_OK) {
 			if (extractCallbackObject->PasswordRequested()) {
 				throw std::runtime_error("Archive password is missing or incorrect");
 			}
-			throw std::runtime_error("7-Zip failed to extract the requested file");
+			throw std::runtime_error("7-Zip failed to extract the requested files");
 		}
-		if (extractCallbackObject->OperationResult()
-			!= NArchive::NExtract::NOperationResult::kOK) {
-			if (extractCallbackObject->PasswordRequested()) {
-				throw std::runtime_error("Archive password is incorrect or encrypted data is invalid");
+		std::vector<std::uint64_t> bytesWritten;
+		bytesWritten.reserve(requests.size());
+		for (const auto& request : requests) {
+			if (request.operationResult != NArchive::NExtract::NOperationResult::kOK) {
+				if (extractCallbackObject->PasswordRequested()) {
+					throw std::runtime_error("Archive password is incorrect or encrypted data is invalid");
+				}
+				if (request.operationResult == NArchive::NExtract::NOperationResult::kWrongPassword) {
+					throw std::runtime_error("Archive password is incorrect");
+				}
+				throw std::runtime_error(
+					"Entry extraction failed (unsupported method, integrity error, or password required): "
+					+ request.path);
 			}
-			if (extractCallbackObject->OperationResult()
-				== NArchive::NExtract::NOperationResult::kWrongPassword) {
-				throw std::runtime_error("Archive password is incorrect");
-			}
-			throw std::runtime_error(
-				"Entry extraction failed (unsupported method, integrity error, or password required)");
+			bytesWritten.push_back(
+				request.stream != nullptr ? request.stream->BytesWritten() : 0);
 		}
-		return extractCallbackObject->BytesWritten();
+		return bytesWritten;
 	}
 
 private:
@@ -2630,21 +2736,19 @@ private:
 	bool completed_ = false;
 };
 
-class ExtractToFileWorker final : public ExtractionTask {
+class ExtractToFilesWorker final : public ExtractionTask {
 public:
-	ExtractToFileWorker(
+	ExtractToFilesWorker(
 		Napi::Promise::Deferred deferred,
 		std::shared_ptr<ArchiveEngine> archive,
-		std::uint32_t entryId,
-		int fileDescriptor,
+		std::vector<std::pair<std::uint32_t, std::string>> outputs,
 		std::shared_ptr<NativeFileTaskState> task)
 		: deferred_(deferred),
 			archive_(std::move(archive)),
-			entryId_(entryId),
-			fileDescriptor_(fileDescriptor),
+			outputs_(std::move(outputs)),
 			task_(std::move(task)) {}
 
-	~ExtractToFileWorker() override
+	~ExtractToFilesWorker() override
 	{
 		RemoveFileTask(task_->id);
 		task_->ReleaseCallback();
@@ -2654,7 +2758,7 @@ public:
 	void Execute() noexcept override
 	{
 		try {
-			bytesWritten_ = archive_->ExtractToFile(entryId_, fileDescriptor_, task_);
+			bytesWritten_ = archive_->ExtractToFiles(outputs_, task_);
 		} catch (const std::exception& error) {
 			error_ = error.what();
 		} catch (...) {
@@ -2668,16 +2772,19 @@ public:
 			deferred_.Reject(Napi::Error::New(env, error_).Value());
 			return;
 		}
-		deferred_.Resolve(Napi::BigInt::New(env, bytesWritten_));
+		Napi::Array result = Napi::Array::New(env, bytesWritten_.size());
+		for (std::size_t index = 0; index < bytesWritten_.size(); ++index) {
+			result.Set(index, Napi::BigInt::New(env, bytesWritten_[index]));
+		}
+		deferred_.Resolve(result);
 	}
 
 private:
 	Napi::Promise::Deferred deferred_;
 	std::shared_ptr<ArchiveEngine> archive_;
-	std::uint32_t entryId_;
-	int fileDescriptor_;
+	std::vector<std::pair<std::uint32_t, std::string>> outputs_;
 	std::shared_ptr<NativeFileTaskState> task_;
-	std::uint64_t bytesWritten_ = 0;
+	std::vector<std::uint64_t> bytesWritten_;
 	std::string error_;
 };
 
@@ -3110,34 +3217,44 @@ Napi::Value StartStream(const Napi::CallbackInfo& info)
 	}
 }
 
-Napi::Value StartExtractToFile(const Napi::CallbackInfo& info)
+Napi::Value StartExtractToFiles(const Napi::CallbackInfo& info)
 {
 	const auto env = info.Env();
-	if ((info.Length() != 3 && info.Length() != 4)
-		|| (info.Length() == 4 && !info[3].IsUndefined() && !info[3].IsFunction())) {
+	if ((info.Length() != 2 && info.Length() != 3)
+		|| !info[1].IsArray()
+		|| (info.Length() == 3 && !info[2].IsUndefined() && !info[2].IsFunction())) {
 		throw Napi::TypeError::New(
-			env, "startExtractToFile(handle, id, fileDescriptor, progressCallback?) expects a handle, entry ID, file descriptor, and optional callback");
+			env, "startExtractToFiles(handle, files, progressCallback?) expects a handle, file list, and optional callback");
 	}
 	const auto handle = GetHandle(info[0]);
 	auto archive = FindArchive(handle);
 	if (!archive) {
 		throw Napi::Error::New(env, "Archive is closed");
 	}
-	std::uint64_t entryId = 0;
-	std::uint64_t fileDescriptor = 0;
-	if (!ReadUnsigned(info[1], entryId)
-		|| entryId > std::numeric_limits<std::uint32_t>::max()) {
-		throw Napi::TypeError::New(env, "Entry ID must be a non-negative 32-bit integer");
+	const auto inputFiles = info[1].As<Napi::Array>();
+	if (inputFiles.Length() > kMaxEntries) {
+		throw Napi::RangeError::New(env, "Folder extraction batch exceeds the native entry limit");
 	}
-	if (!ReadUnsigned(info[2], fileDescriptor)
-		|| fileDescriptor > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
-		throw Napi::TypeError::New(env, "File descriptor must be a non-negative integer");
+	std::vector<std::pair<std::uint32_t, std::string>> outputs;
+	outputs.reserve(inputFiles.Length());
+	for (std::uint32_t index = 0; index < inputFiles.Length(); ++index) {
+		const auto value = inputFiles.Get(index);
+		if (!value.IsObject() || value.IsNull()) {
+			throw Napi::TypeError::New(env, "Folder extraction files must be objects");
+		}
+		const auto file = value.As<Napi::Object>();
+		std::uint64_t id = 0;
+		const auto path = file.Get("path");
+		if (!ReadUnsigned(file.Get("id"), id)
+			|| id > std::numeric_limits<std::uint32_t>::max()
+			|| !path.IsString()) {
+			throw Napi::TypeError::New(
+				env, "Folder extraction files require a valid entry ID and output path");
+		}
+		outputs.emplace_back(
+			static_cast<std::uint32_t>(id),
+			path.As<Napi::String>().Utf8Value());
 	}
-#ifdef _WIN32
-	if (::_setmode(static_cast<int>(fileDescriptor), _O_BINARY) == -1) {
-		throw Napi::Error::New(env, "Unable to set the extraction output file to binary mode");
-	}
-#endif
 	if (g_extractionPool == nullptr) {
 		throw Napi::Error::New(env, "Native extraction pool is not initialized");
 	}
@@ -3146,15 +3263,15 @@ Napi::Value StartExtractToFile(const Napi::CallbackInfo& info)
 	}
 
 	std::shared_ptr<NativeFileTaskState> task;
-	ExtractToFileWorker *worker = nullptr;
+	ExtractToFilesWorker *worker = nullptr;
 	std::uint64_t taskId = 0;
 	try {
 		task = std::make_shared<NativeFileTaskState>();
-		if (info.Length() == 4 && info[3].IsFunction()) {
+		if (info.Length() == 3 && info[2].IsFunction()) {
 			task->progressCallback = Napi::ThreadSafeFunction::New(
 				env,
-				info[3].As<Napi::Function>(),
-				"7zip-native file extraction progress",
+				info[2].As<Napi::Function>(),
+				"7zip-native folder extraction progress",
 				1,
 				1);
 			task->hasProgressCallback_ = true;
@@ -3164,11 +3281,10 @@ Napi::Value StartExtractToFile(const Napi::CallbackInfo& info)
 		auto result = Napi::Object::New(env);
 		result.Set("taskId", Napi::BigInt::New(env, taskId));
 		result.Set("promise", deferred.Promise());
-		worker = new ExtractToFileWorker(
+		worker = new ExtractToFilesWorker(
 			deferred,
 			std::move(archive),
-			static_cast<std::uint32_t>(entryId),
-			static_cast<int>(fileDescriptor),
+			std::move(outputs),
 			task);
 		g_extractionPool->Queue(env, worker);
 		worker = nullptr;
@@ -3200,17 +3316,17 @@ Napi::Value StartExtractToFile(const Napi::CallbackInfo& info)
 			}
 			g_pendingOperations.fetch_sub(1, std::memory_order_acq_rel);
 		}
-		throw Napi::Error::New(env, "Unable to queue native file extraction");
+		throw Napi::Error::New(env, "Unable to queue native folder extraction");
 	}
 }
 
-Napi::Value CancelExtractToFile(const Napi::CallbackInfo& info)
+Napi::Value CancelExtractToFiles(const Napi::CallbackInfo& info)
 {
 	const auto env = info.Env();
 	std::uint64_t taskId = 0;
 	if (info.Length() != 1 || !ReadUnsigned(info[0], taskId) || taskId == 0) {
 		throw Napi::TypeError::New(
-			env, "cancelExtractToFile(taskId) expects a positive task ID");
+			env, "cancelExtractToFiles(taskId) expects a positive task ID");
 	}
 	if (const auto task = FindFileTask(taskId)) {
 		task->Cancel();
@@ -3382,8 +3498,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports)
 	exports.Set("extract", Napi::Function::New(env, Extract));
 	exports.Set("readMany", Napi::Function::New(env, ReadMany));
 	exports.Set("startStream", Napi::Function::New(env, StartStream));
-	exports.Set("startExtractToFile", Napi::Function::New(env, StartExtractToFile));
-	exports.Set("cancelExtractToFile", Napi::Function::New(env, CancelExtractToFile));
+	exports.Set("startExtractToFiles", Napi::Function::New(env, StartExtractToFiles));
+	exports.Set("cancelExtractToFiles", Napi::Function::New(env, CancelExtractToFiles));
 	exports.Set("resumeStream", Napi::Function::New(env, ResumeStream));
 	exports.Set("cancelStream", Napi::Function::New(env, CancelStream));
 	exports.Set("read", Napi::Function::New(env, Read));

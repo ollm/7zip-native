@@ -110,17 +110,16 @@ async function withPlatform(platform: string, operation: () => Promise<void>): P
 	}
 }
 
-function stubNativeFileExtraction(
+function stubNativeFileBatchExtraction(
 	archive: Archive,
 	extract: (
-		id: number,
-		outputPath: string,
+		outputs: readonly {id: number; path: string}[],
 		signal: AbortSignal,
 		onBytesWritten?: (bytesWritten: bigint) => void,
-	) => Promise<bigint>,
+	) => Promise<bigint[]>,
 ): void
 {
-	assert.equal(Reflect.set(archive, 'extractEntryToFile', extract), true);
+	assert.equal(Reflect.set(archive, 'extractEntriesToFiles', extract), true);
 }
 
 let directory = '';
@@ -728,37 +727,42 @@ test('bounds folder extraction concurrency and reports completion out of order',
 	try
 	{
 		Archive.concurrency(4);
-		stubNativeFileExtraction(archive, async (id, outputPath, signal, onBytesWritten) => {
-			const entry = entriesById.get(id);
-			assert.ok(entry);
+		stubNativeFileBatchExtraction(archive, async (outputs, signal, onBytesWritten) => {
 			active++;
 			maximumActive = Math.max(maximumActive, active);
-			const chunks: Buffer[] = [];
 			try
 			{
-				if(entry.path === 'slow.txt')
+				const bytesWritten: bigint[] = [];
+				for(const output of outputs)
 				{
-					await delay(5, undefined, {signal});
-					chunks.push(Buffer.from('abc'));
-					onBytesWritten?.(3n);
-					await delay(40, undefined, {signal});
-					chunks.push(Buffer.from('def'));
-					onBytesWritten?.(3n);
+					const entry = entriesById.get(output.id);
+					assert.ok(entry);
+					let contents: Buffer;
+					if(entry.path === 'slow.txt')
+					{
+						await delay(5, undefined, {signal});
+						contents = Buffer.from('abc');
+						onBytesWritten?.(3n);
+						await delay(40, undefined, {signal});
+						contents = Buffer.concat([contents, Buffer.from('def')]);
+						onBytesWritten?.(3n);
+					}
+					else if(entry.path === 'fast.txt')
+					{
+						await delay(10, undefined, {signal});
+						contents = Buffer.from('wxyz');
+						onBytesWritten?.(4n);
+					}
+					else
+					{
+						await delay(5, undefined, {signal});
+						contents = Buffer.from('123');
+						onBytesWritten?.(3n);
+					}
+					await writeFile(output.path, contents);
+					bytesWritten.push(BigInt(contents.length));
 				}
-				else if(entry.path === 'fast.txt')
-				{
-					await delay(10, undefined, {signal});
-					chunks.push(Buffer.from('wxyz'));
-					onBytesWritten?.(4n);
-				}
-				else
-				{
-					await delay(5, undefined, {signal});
-					chunks.push(Buffer.from('123'));
-					onBytesWritten?.(3n);
-				}
-				await writeFile(outputPath, Buffer.concat(chunks));
-				return BigInt(Buffer.concat(chunks).length);
+				return bytesWritten;
 			}
 			finally
 			{
@@ -776,8 +780,8 @@ test('bounds folder extraction concurrency and reports completion out of order',
 		});
 		assert.equal(maximumActive, 2);
 		assert.equal(active, 0);
-		assert.deepEqual(completions, ['fast.txt', 'middle.txt', 'slow.txt']);
-		assert.ok(progress.some(update => update.filesExtracted === 1 && update.bytesProcessed === 7n));
+		assert.deepEqual(completions, ['fast.txt', 'slow.txt', 'middle.txt']);
+		assert.ok(progress.some(update => update.filesExtracted === 0 && update.bytesProcessed === 7n));
 		assert.deepEqual(progress.at(-1), {filesExtracted: 3, bytesProcessed: 13n});
 		assert.equal(Archive.concurrency(), 4);
 		assert.deepEqual(await readFile(join(destination, 'slow.txt')), Buffer.from('abcdef'));
@@ -833,23 +837,31 @@ test('stops scheduling on extraction failure and removes overwrite temporaries',
 	try
 	{
 		Archive.concurrency(4);
-		stubNativeFileExtraction(archive, async (id, outputPath, signal, onBytesWritten) => {
-			const entry = entriesById.get(id);
-			assert.ok(entry);
+		stubNativeFileBatchExtraction(archive, async (outputs, signal, onBytesWritten) => {
 			active++;
 			started++;
 			try
 			{
-				if(entry.path === 'fail.txt')
+				const entries = outputs.map(output => {
+					const entry = entriesById.get(output.id);
+					assert.ok(entry);
+					return {output, entry};
+				});
+				if(entries.some(({entry}) => entry.path === 'fail.txt'))
 				{
 					await delay(10, undefined, {signal});
 					throw new Error('injected extraction failure');
 				}
 				await delay(1000, undefined, {signal});
-				const output = Buffer.from(entry.path);
-				onBytesWritten?.(BigInt(output.length));
-				await writeFile(outputPath, output);
-				return BigInt(output.length);
+				const bytesWritten: bigint[] = [];
+				for(const {output, entry} of entries)
+				{
+					const contents = Buffer.from(entry.path);
+					onBytesWritten?.(BigInt(contents.length));
+					await writeFile(output.path, contents);
+					bytesWritten.push(BigInt(contents.length));
+				}
+				return bytesWritten;
 			}
 			finally
 			{
@@ -902,9 +914,7 @@ test('cancels active folder extractions before rejecting and removes overwrite t
 	try
 	{
 		Archive.concurrency(4);
-		stubNativeFileExtraction(archive, async (id, outputPath, signal, onBytesWritten) => {
-			const entry = entriesById.get(id);
-			assert.ok(entry);
+		stubNativeFileBatchExtraction(archive, async (outputs, signal, onBytesWritten) => {
 			active++;
 			started++;
 			if(started === 2)
@@ -914,10 +924,17 @@ test('cancels active folder extractions before rejecting and removes overwrite t
 			try
 			{
 				await delay(1000, undefined, {signal});
-				const output = Buffer.from(entry.path);
-				onBytesWritten?.(BigInt(output.length));
-				await writeFile(outputPath, output);
-				return BigInt(output.length);
+				const bytesWritten: bigint[] = [];
+				for(const output of outputs)
+				{
+					const entry = entriesById.get(output.id);
+					assert.ok(entry);
+					const contents = Buffer.from(entry.path);
+					onBytesWritten?.(BigInt(contents.length));
+					await writeFile(output.path, contents);
+					bytesWritten.push(BigInt(contents.length));
+				}
+				return bytesWritten;
 			}
 			finally
 			{
