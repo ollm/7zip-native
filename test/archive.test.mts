@@ -19,6 +19,11 @@ const testPassword = 'correct-horse';
 const sampleDirectory = fileURLToPath(new URL('../samples/', import.meta.url));
 const sourcePackageDirectory = fileURLToPath(new URL('../', import.meta.url));
 const sampleArchives = ['sample.7z', 'sample.rar', 'sample.tar', 'sample.wim', 'sample.zip'] as const;
+const truncatedSampleArchives = [
+	'sample-truncated.rar',
+	'sample-truncated.tar',
+	'sample-truncated.zip',
+] as const;
 const sampleAssetPaths = [
 	'sample/noise.avif',
 	'sample/noise.jpg',
@@ -1078,6 +1083,29 @@ for(const archiveName of sampleArchives)
 				Buffer.concat(streamed),
 				await readFile(join(sampleDirectory, first.path)),
 				`${archiveName}: streamed ${first.path}`,
+			);
+		}
+		finally
+		{
+			await archive.close();
+		}
+	});
+}
+
+for(const archiveName of truncatedSampleArchives)
+{
+	test(`lists and extracts the first file from ${archiveName}`, async () => {
+		const archive = await Archive.open(join(sampleDirectory, archiveName));
+		try
+		{
+			const entries = await archive.entries();
+			assert.ok(entries.length > 0, `${archiveName}: expected at least one entry`);
+			const first = entries.find(entry => !entry.isDirectory);
+			assert.ok(first, `${archiveName}: expected at least one file`);
+			assert.deepEqual(
+				await archive.extract(first.id),
+				await readFile(join(sampleDirectory, first.path)),
+				`${archiveName}: ${first.path}`,
 			);
 		}
 		finally

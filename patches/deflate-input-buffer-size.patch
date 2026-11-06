@@ -27,7 +27,7 @@ index 7993176..5f3d9d4 100644
 +
 +STDAPI SetDeflateInputBufferSize(UInt32 bufferSize)
 +{
-+  if (bufferSize < (1 << 12) || bufferSize > (1 << 20))
++  if (bufferSize < (1 << 12) || bufferSize > (1 << 21))
 +    return E_INVALIDARG;
 +  g_deflateInputBufferSize = bufferSize;
 +  return S_OK;
