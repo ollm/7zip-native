@@ -259,10 +259,13 @@ test('preserves source modification times in 7z archives', async () => {
 		format: '7z',
 	});
 
-	const {stdout} = await execFileAsync(sevenZip.path7zc, ['l', '-slt', outputPath], {
-		env: {...process.env, TZ: 'UTC'},
-	});
-	assert.match(stdout, /Modified = 2020-04-05 06:07:08/);
+	const {stdout} = await execFileAsync(sevenZip.path7zc, ['l', '-slt', outputPath]);
+	const displayOffset = new Date().getTimezoneOffset();
+	const expectedModified = new Date(modified.getTime() - displayOffset * 60_000)
+		.toISOString()
+		.slice(0, 19)
+		.replace('T', ' ');
+	assert.match(stdout, new RegExp(`Modified = ${expectedModified}`));
 });
 
 test('opens, indexes, partially reads, and extracts ZIP entries', async () => {
