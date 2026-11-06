@@ -1,10 +1,10 @@
-import {createWriteStream, existsSync} from 'node:fs';
-import {link, lstat, mkdir, rename, rm} from 'node:fs/promises';
+import {existsSync} from 'node:fs';
+import {link, lstat, mkdir, open as openFile, rename, rm} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 import {createRequire} from 'node:module';
 import {availableParallelism} from 'node:os';
 import {dirname, extname, join, relative as relativePath, resolve, sep} from 'node:path';
-import {Readable, Transform, type Writable} from 'node:stream';
+import {Readable, type Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {
 	ArchiveError,
@@ -44,6 +44,13 @@ type NativeStreamCallback = (
 	error: Error | undefined,
 	done: boolean,
 ) => void;
+
+type NativeFileProgressCallback = (bytesWritten: bigint) => void;
+
+interface NativeFileTask {
+	readonly taskId: bigint;
+	readonly promise: Promise<bigint>;
+}
 
 const defaultMaxOutputBytes = 4n * 1024n * 1024n * 1024n;
 const defaultDeflateBufferSize = 32 * 1024;
@@ -92,6 +99,13 @@ interface NativeBinding {
 		requests: readonly {id: number; offset: bigint; length: bigint}[],
 	): Promise<Buffer[]>;
 	startStream(handle: bigint, id: number, callback: NativeStreamCallback): bigint;
+	startExtractToFile(
+		handle: bigint,
+		id: number,
+		fileDescriptor: number,
+		progressCallback?: NativeFileProgressCallback,
+	): NativeFileTask;
+	cancelExtractToFile(taskId: bigint): void;
 	resumeStream(streamId: bigint): void;
 	cancelStream(streamId: bigint): void;
 	read(handle: bigint, id: number, offset: bigint, length: bigint): Promise<Buffer>;
@@ -971,73 +985,69 @@ export class Archive {
 		};
 		options.signal?.addEventListener('abort', abortFromCaller, {once: true});
 
-		const extractFile = async(plan: OutputPlan): Promise<void> => {
-			await ensureOutputParents(root, plan.targetPath);
-			const limit = new Transform({
-				transform(chunk: Buffer, _encoding, callback) {
-					const size = BigInt(chunk.length);
-					if(maxBytes !== null && extractedBytes + size > maxBytes)
-					{
-						callback(new ArchiveError(
-							'ERR_RESOURCE_LIMIT',
-							`Folder output exceeds the ${maxBytes}-byte limit`,
-						));
-						return;
-					}
-					extractedBytes += size;
-					try
-					{
-						reportProgress();
-					}
-					catch (error)
-					{
-						callback(error instanceof Error ? error : new Error(String(error)));
-						return;
-					}
-					callback(null, chunk);
-				},
-			});
-			if(options.overwrite)
-			{
-				await assertReplaceableOutput(plan.targetPath);
-				const temporaryPath = join(dirname(plan.targetPath), `.7zip-native-${randomUUID()}.tmp`);
+		let reportBytesWritten: NativeFileProgressCallback | undefined;
+		if(options.onProgress)
+		{
+			reportBytesWritten = (bytesWritten) => {
+				if(hasFailure)
+				{
+					return;
+				}
+				extractedBytes += bytesWritten;
 				try
 				{
-					await pipeline(
-						this.createReadStream(plan.entry.id, {
-							signal: extractionSignal,
-							maxBytes: null,
-						}),
-						limit,
-						createWriteStream(temporaryPath, {flags: 'wx', mode: 0o600}),
-						{signal: extractionSignal},
-					);
-					extractionSignal.throwIfAborted();
-					await assertReplaceableOutput(plan.targetPath);
-					extractionSignal.throwIfAborted();
-					await rename(temporaryPath, plan.targetPath);
+					reportProgress();
 				}
 				catch (error)
 				{
-					await rm(temporaryPath, {force: true});
-					throw error;
+					stop(error);
 				}
-			}
-			else
+			};
+		}
+
+		const extractFile = async(plan: OutputPlan): Promise<void> => {
+			await ensureOutputParents(root, plan.targetPath);
+			extractionSignal.throwIfAborted();
+			let temporaryPath: string | undefined;
+			let outputPath = plan.targetPath;
+			if(options.overwrite)
 			{
-				await pipeline(
-					this.createReadStream(plan.entry.id, {
-						signal: extractionSignal,
-						maxBytes: null,
-					}),
-					limit,
-					createWriteStream(plan.targetPath, {flags: 'wx', mode: 0o600}),
-					{signal: extractionSignal},
-				);
+				await assertReplaceableOutput(plan.targetPath);
+				temporaryPath = join(dirname(plan.targetPath), `.7zip-native-${randomUUID()}.tmp`);
+				outputPath = temporaryPath;
 			}
-			filesExtracted++;
-			reportProgress();
-			options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
+			try
+			{
+				const bytesWritten = await this.extractEntryToFile(
+					plan.entry.id,
+					outputPath,
+					extractionSignal,
+					reportBytesWritten,
+				);
+				if(reportBytesWritten === undefined)
+				{
+					extractedBytes += bytesWritten;
+				}
+				extractionSignal.throwIfAborted();
+				if(temporaryPath)
+				{
+					await assertReplaceableOutput(plan.targetPath);
+					extractionSignal.throwIfAborted();
+					await rename(temporaryPath, plan.targetPath);
+					temporaryPath = undefined;
+				}
+				filesExtracted++;
+				reportProgress();
+				options.onExtract?.({entry: plan.entry, outputPath: plan.targetPath});
+			}
+			catch (error)
+			{
+				if(temporaryPath)
+				{
+					await rm(temporaryPath, {force: true});
+				}
+				throw error;
+			}
 		};
 
 		const runWorker = async(): Promise<void> => {
@@ -1188,6 +1198,51 @@ export class Archive {
 		catch (cause)
 		{
 			throw extractionError(cause);
+		}
+	}
+
+	private async extractEntryToFile(
+		id: EntryId,
+		outputPath: string,
+		signal: AbortSignal,
+		onBytesWritten?: NativeFileProgressCallback,
+	): Promise<bigint> {
+		const fileHandle = await openFile(outputPath, 'wx', 0o600);
+		let task: NativeFileTask | undefined;
+		const cancelTask = (): void => {
+			if(task)
+			{
+				native.cancelExtractToFile(task.taskId);
+			}
+		};
+		try
+		{
+			signal.throwIfAborted();
+			task = native.startExtractToFile(
+				this.handle,
+				id,
+				fileHandle.fd,
+				onBytesWritten,
+			);
+			signal.addEventListener('abort', cancelTask, {once: true});
+			if(signal.aborted)
+			{
+				cancelTask();
+			}
+			return await task.promise;
+		}
+		catch (cause)
+		{
+			if(signal.aborted)
+			{
+				throw signal.reason ?? cause;
+			}
+			throw extractionError(cause);
+		}
+		finally
+		{
+			signal.removeEventListener('abort', cancelTask);
+			await fileHandle.close();
 		}
 	}
 

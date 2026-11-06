@@ -223,6 +223,8 @@ await archive.extractToFolder('./unpacked', {
 - `maxBytes`: Maximum total uncompressed output size. Defaults to 4 GiB; set to `null` to disable the limit.
 - `signal`: Optional `AbortSignal`. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
 
+The 7-Zip native worker writes extracted bytes directly to the destination file descriptor; file contents are not streamed through Node.js or Electron. The JavaScript layer still validates paths, creates output files securely, reports progress, and performs atomic replacement when `overwrite` is enabled.
+
 On Windows only, invalid filename characters (`< > : | ? * "`) and trailing dots/spaces in each destination component are replaced with `_`; selectors and entry metadata remain unchanged. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 
 ### Concurrency
@@ -370,6 +372,23 @@ npm run benchmark:concurrency -- \
 ```
 
 The report includes median and p95 latency, throughput, speedup, and the number of entries that can overlap. `--max-files` selects evenly spaced entries, which is useful when sampling solid archives. Benchmarks report measurements only; results depend on the archive, machine, and workload and do not guarantee a speedup.
+
+Compare parallel extraction of every file in the archive, divided among promises:
+
+```sh
+npm run benchmark:multiprocess -- \
+	--archive "./archive.zip" \
+	--parallel-counts 1,2,4 \
+	--iterations 3
+
+ELECTRON_RUN_AS_NODE=1 electron bench/multiprocess-extract.cjs \
+	--archive "./archive.zip" \
+	--parallel-counts 1,2,4 \
+	--iterations 3 \
+	--deflate-buffer-size 262144
+```
+
+For each parallel count, the benchmark uses `Promise.all()`: every `7zip-native` promise opens its own handle to the same archive, and every `7zip-bin-full` promise spawns one `7zzc` command. All non-directory files in the archive are divided as evenly as possible among the concurrent operations. The native extraction pool is sized to the maximum requested parallel count so native promises can run concurrently. Outputs go to separate temporary directories and are verified by file size before cleanup. The report includes `Archive.open()` and CLI startup time. Native operations stay in the benchmark's Node/Electron process; only the CLI baseline spawns child processes.
 
 Compare `extractToFolder()` concurrency (1 through 16) across one or more archives:
 

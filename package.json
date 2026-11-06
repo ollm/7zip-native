@@ -60,7 +60,8 @@
 		"benchmark": "node --experimental-strip-types bench/benchmark.mts",
 		"benchmark:concurrency": "node --experimental-strip-types bench/concurrency.mts",
 		"benchmark:folder-concurrency": "node --experimental-strip-types bench/folder-concurrency.mts",
-		"benchmark:compare": "node --experimental-strip-types bench/compare.mts"
+		"benchmark:compare": "node --experimental-strip-types bench/compare.mts",
+		"benchmark:multiprocess": "node bench/multiprocess-extract.cjs"
 	},
 	"keywords": [
 		"7zip",

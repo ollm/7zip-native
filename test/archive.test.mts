@@ -5,7 +5,7 @@ import {copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeF
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {Readable, Writable} from 'node:stream';
+import {Writable} from 'node:stream';
 import {after, before, test} from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
@@ -108,6 +108,19 @@ async function withPlatform(platform: string, operation: () => Promise<void>): P
 	{
 		Object.defineProperty(process, 'platform', descriptor);
 	}
+}
+
+function stubNativeFileExtraction(
+	archive: Archive,
+	extract: (
+		id: number,
+		outputPath: string,
+		signal: AbortSignal,
+		onBytesWritten?: (bytesWritten: bigint) => void,
+	) => Promise<bigint>,
+): void
+{
+	assert.equal(Reflect.set(archive, 'extractEntryToFile', extract), true);
 }
 
 let directory = '';
@@ -715,40 +728,43 @@ test('bounds folder extraction concurrency and reports completion out of order',
 	try
 	{
 		Archive.concurrency(4);
-		archive.createReadStream = (id, options) => Readable.from((async function*() {
-			if(typeof id !== 'number')
-			{
-				throw new TypeError('Expected an entry ID');
-			}
+		stubNativeFileExtraction(archive, async (id, outputPath, signal, onBytesWritten) => {
 			const entry = entriesById.get(id);
 			assert.ok(entry);
 			active++;
 			maximumActive = Math.max(maximumActive, active);
+			const chunks: Buffer[] = [];
 			try
 			{
 				if(entry.path === 'slow.txt')
 				{
-					await delay(5, undefined, {signal: options?.signal});
-					yield Buffer.from('abc');
-					await delay(40, undefined, {signal: options?.signal});
-					yield Buffer.from('def');
+					await delay(5, undefined, {signal});
+					chunks.push(Buffer.from('abc'));
+					onBytesWritten?.(3n);
+					await delay(40, undefined, {signal});
+					chunks.push(Buffer.from('def'));
+					onBytesWritten?.(3n);
 				}
 				else if(entry.path === 'fast.txt')
 				{
-					await delay(10, undefined, {signal: options?.signal});
-					yield Buffer.from('wxyz');
+					await delay(10, undefined, {signal});
+					chunks.push(Buffer.from('wxyz'));
+					onBytesWritten?.(4n);
 				}
 				else
 				{
-					await delay(5, undefined, {signal: options?.signal});
-					yield Buffer.from('123');
+					await delay(5, undefined, {signal});
+					chunks.push(Buffer.from('123'));
+					onBytesWritten?.(3n);
 				}
+				await writeFile(outputPath, Buffer.concat(chunks));
+				return BigInt(Buffer.concat(chunks).length);
 			}
 			finally
 			{
 				active--;
 			}
-		})());
+		});
 
 		await archive.extractToFolder(destination, {
 			concurrency: 2,
@@ -817,11 +833,7 @@ test('stops scheduling on extraction failure and removes overwrite temporaries',
 	try
 	{
 		Archive.concurrency(4);
-		archive.createReadStream = (id, options) => Readable.from((async function*() {
-			if(typeof id !== 'number')
-			{
-				throw new TypeError('Expected an entry ID');
-			}
+		stubNativeFileExtraction(archive, async (id, outputPath, signal, onBytesWritten) => {
 			const entry = entriesById.get(id);
 			assert.ok(entry);
 			active++;
@@ -830,17 +842,20 @@ test('stops scheduling on extraction failure and removes overwrite temporaries',
 			{
 				if(entry.path === 'fail.txt')
 				{
-					await delay(10, undefined, {signal: options?.signal});
+					await delay(10, undefined, {signal});
 					throw new Error('injected extraction failure');
 				}
-				await delay(1000, undefined, {signal: options?.signal});
-				yield Buffer.from(entry.path);
+				await delay(1000, undefined, {signal});
+				const output = Buffer.from(entry.path);
+				onBytesWritten?.(BigInt(output.length));
+				await writeFile(outputPath, output);
+				return BigInt(output.length);
 			}
 			finally
 			{
 				active--;
 			}
-		})());
+		});
 
 		await assert.rejects(
 			archive.extractToFolder(destination, {concurrency: 2, overwrite: true}),
@@ -887,11 +902,7 @@ test('cancels active folder extractions before rejecting and removes overwrite t
 	try
 	{
 		Archive.concurrency(4);
-		archive.createReadStream = (id, options) => Readable.from((async function*() {
-			if(typeof id !== 'number')
-			{
-				throw new TypeError('Expected an entry ID');
-			}
+		stubNativeFileExtraction(archive, async (id, outputPath, signal, onBytesWritten) => {
 			const entry = entriesById.get(id);
 			assert.ok(entry);
 			active++;
@@ -902,14 +913,17 @@ test('cancels active folder extractions before rejecting and removes overwrite t
 			}
 			try
 			{
-				await delay(1000, undefined, {signal: options?.signal});
-				yield Buffer.from(entry.path);
+				await delay(1000, undefined, {signal});
+				const output = Buffer.from(entry.path);
+				onBytesWritten?.(BigInt(output.length));
+				await writeFile(outputPath, output);
+				return BigInt(output.length);
 			}
 			finally
 			{
 				active--;
 			}
-		})());
+		});
 
 		const extraction = archive.extractToFolder(destination, {
 			concurrency: 2,
@@ -935,6 +949,43 @@ test('cancels active folder extractions before rejecting and removes overwrite t
 	finally
 	{
 		Archive.concurrency(previousConcurrency);
+		await archive.close();
+	}
+});
+
+test('cancels native file writes and preserves overwritten outputs', async () => {
+	const localArchivePath = join(directory, 'cancelled-native-folder.zip');
+	const destination = join(directory, 'cancelled-native-folder-output');
+	const outputPath = join(destination, 'large.bin');
+	const previousOutput = Buffer.from('keep existing output');
+	await writeFile(localArchivePath, makeStoredZip([
+		{name: 'large.bin', data: 'x'.repeat(2 * 1024 * 1024)},
+	]));
+	await mkdir(destination);
+	await writeFile(outputPath, previousOutput);
+	const archive = await Archive.open(localArchivePath);
+	const controller = new AbortController();
+	try
+	{
+		await assert.rejects(
+			archive.extractToFolder(destination, {
+				paths: ['large.bin'],
+				overwrite: true,
+				signal: controller.signal,
+				onProgress: (progress) => {
+					if(progress.bytesProcessed > 0n && !controller.signal.aborted)
+					{
+						controller.abort(new Error('cancelled native file write'));
+					}
+				},
+			}),
+			/cancelled native file write/,
+		);
+		assert.deepEqual(await readFile(outputPath), previousOutput);
+		assert.deepEqual(await readdir(destination), ['large.bin']);
+	}
+	finally
+	{
 		await archive.close();
 	}
 });
