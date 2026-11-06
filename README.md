@@ -66,6 +66,11 @@ const archive = await Archive.open('./archive.7z', {password: 'secret'});
 `Archive.open()` accepts these options:
 
 - `password`: Passed to the upstream handler if it requests a password. It is held for the lifetime of the archive handle, is not logged, and is limited to 1 MiB of UTF-8 data.
+- `deflateBufferSize`: Input buffer size in bytes for Deflate extraction. Defaults to `32768`; accepts integers from `4096` through `2097152`. It is stored per archive and applied to each extraction, so different open archives can use different values.
+
+```ts
+const archive = await Archive.open('./archive.zip', {deflateBufferSize: 32768});
+```
 
 ### Listing and looking up entries
 
@@ -341,7 +346,7 @@ BENCH_ITERATIONS=20 npm run benchmark -- "./archive.zip"
 
 It measures native open/list, prefix reads, full extraction, and reads across independent archive handles. `BENCH_ITERATIONS` defaults to 15 and must be at least 3.
 
-Compare the native API with the `7zip-bin-full` command-line baseline:
+Compare the native API with the `7zzc` command-line baseline from `7zip-bin-full`:
 
 ```sh
 npm run benchmark:compare -- \
@@ -352,7 +357,7 @@ npm run benchmark:compare -- \
 	--concurrency 4
 ```
 
-The comparison validates entry listings and output data before reporting median and p95 latency. CLI timings include process startup. Since the CLI has no ranged-read API, its range baseline extracts the entry to stdout and slices the requested bytes; this is not equivalent to native range reading. Captured output is capped at 256 MiB, and full-archive comparison is skipped if an entry exceeds that limit.
+The comparison validates entry listings and output data before reporting median and p95 latency. CLI timings include process startup. Prefix reads use `-slb`; non-solid archives abort decoding per item once the byte limit is reached. For a range, the CLI emits through `offset + length` and slices stdout because it has no ranged-read API; this still needs to decode the preceding bytes. Captured output is capped at 256 MiB, and full-archive comparison is skipped if an entry exceeds that limit.
 
 Compare extraction concurrency:
 

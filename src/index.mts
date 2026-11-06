@@ -46,6 +46,9 @@ type NativeStreamCallback = (
 ) => void;
 
 const defaultMaxOutputBytes = 4n * 1024n * 1024n * 1024n;
+const defaultDeflateBufferSize = 32 * 1024;
+const minDeflateBufferSize = 4 * 1024;
+const maxDeflateBufferSize = 2 * 1024 * 1024;
 
 function normalizeMaxBytes(
 	value: number | bigint | null | undefined,
@@ -76,7 +79,12 @@ function normalizeMaxBytes(
 }
 
 interface NativeBinding {
-	open(path: string, password: string | undefined, enginePath: string): Promise<bigint>;
+	open(
+		path: string,
+		password: string | undefined,
+		enginePath: string,
+		deflateBufferSize: number,
+	): Promise<bigint>;
 	entries(handle: bigint): Promise<NativeEntry[]>;
 	extract(handle: bigint, ids: readonly number[]): Promise<Buffer[]>;
 	readMany(
@@ -530,9 +538,23 @@ export class Archive {
 				throw new RangeError('Password exceeds the 1 MiB native password limit');
 			}
 		}
+		const deflateBufferSize = options.deflateBufferSize ?? defaultDeflateBufferSize;
+		if(!Number.isSafeInteger(deflateBufferSize)
+			|| deflateBufferSize < minDeflateBufferSize
+			|| deflateBufferSize > maxDeflateBufferSize)
+		{
+			throw new RangeError(
+				`Deflate buffer size must be an integer between ${minDeflateBufferSize} and ${maxDeflateBufferSize} bytes`,
+			);
+		}
 		try
 		{
-			const handle = await native.open(resolve(path), options.password, enginePath);
+			const handle = await native.open(
+				resolve(path),
+				options.password,
+				enginePath,
+				deflateBufferSize,
+			);
 			return new Archive(handle);
 		}
 		catch (cause)

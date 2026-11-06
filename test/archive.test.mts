@@ -14,7 +14,7 @@ import {gzipSync} from 'node:zlib';
 import {Archive, ArchiveError, type ArchiveEntry} from '../dist/index.mjs';
 
 const execFileAsync = promisify(execFile);
-const sevenZip = createRequire(import.meta.url)('7zip-bin-full') as {path7z: string};
+const sevenZip = createRequire(import.meta.url)('7zip-bin-full') as {path7zc: string};
 const testPassword = 'correct-horse';
 const sampleDirectory = fileURLToPath(new URL('../samples/', import.meta.url));
 const sourcePackageDirectory = fileURLToPath(new URL('../', import.meta.url));
@@ -154,10 +154,10 @@ before(async () => {
 	]));
 	await writeFile(gzipPath, gzipSync('native gzip handler'));
 	await writeFile(protectedFilePath, 'password-protected archive data');
-	await execFileAsync(sevenZip.path7z, [
+	await execFileAsync(sevenZip.path7zc, [
 		'a', '-t7z', '-y', '-bd', '-bb0', sevenZipArchivePath, protectedFilePath,
 	]);
-	await execFileAsync(sevenZip.path7z, [
+	await execFileAsync(sevenZip.path7zc, [
 		'a', '-tzip', `-p${testPassword}`, '-mem=AES256', '-y', '-bd', '-bb0',
 		encryptedZipPath, protectedFilePath,
 	]);
@@ -242,7 +242,7 @@ test('preserves source modification times in 7z archives', async () => {
 		format: '7z',
 	});
 
-	const {stdout} = await execFileAsync(sevenZip.path7z, ['l', '-slt', outputPath], {
+	const {stdout} = await execFileAsync(sevenZip.path7zc, ['l', '-slt', outputPath], {
 		env: {...process.env, TZ: 'UTC'},
 	});
 	assert.match(stdout, /Modified = 2020-04-05 06:07:08/);
@@ -295,6 +295,39 @@ test('opens, indexes, partially reads, and extracts ZIP entries', async () => {
 	finally
 	{
 		await archive.close();
+	}
+});
+
+test('configures the Deflate input buffer per archive and validates its range', async () => {
+	const archivePath = join(sampleDirectory, 'sample.zip');
+	const archive = await Archive.open(archivePath);
+	const entry = (await archive.entries()).find(item => !item.isDirectory);
+	assert.ok(entry);
+	await archive.close();
+
+	const expected = await readFile(join(sampleDirectory, entry.path));
+	const sizes = [4 * 1024, 32 * 1024, 32 * 1024 + 1, 2 * 1024 * 1024];
+	const archives = await Promise.all(sizes.map(deflateBufferSize =>
+		Archive.open(archivePath, {deflateBufferSize})));
+	try
+	{
+		const outputs = await Promise.all(archives.map(item => item.extract(entry.id)));
+		for(const output of outputs)
+		{
+			assert.deepEqual(output, expected);
+		}
+	}
+	finally
+	{
+		await Promise.all(archives.map(item => item.close()));
+	}
+
+	for(const deflateBufferSize of [4095, 2 * 1024 * 1024 + 1, 1.5, Number.NaN])
+	{
+		await assert.rejects(
+			Archive.open(archivePath, {deflateBufferSize}),
+			RangeError,
+		);
 	}
 });
 

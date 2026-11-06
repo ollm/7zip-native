@@ -30,6 +30,7 @@
 		"dist/",
 		"prebuilds/",
 		"native/",
+		"patches/",
 		"scripts/",
 		"vendor/7zip/",
 		"binding.gyp",

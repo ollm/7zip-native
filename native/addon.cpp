@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <codecvt>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <cwctype>
 #include <deque>
 #include <filesystem>
@@ -45,11 +48,14 @@ constexpr std::uint64_t kMaxSingleOutputBytes = 256ULL * 1024 * 1024;
 constexpr std::uint64_t kMaxConcurrentOutputBytes = 512ULL * 1024 * 1024;
 constexpr std::uint64_t kMaxReadBytes = 64ULL * 1024 * 1024;
 constexpr std::size_t kMaxPasswordBytes = 1024 * 1024;
+constexpr std::uint32_t kMinDeflateBufferSize = 4 * 1024;
+constexpr std::uint32_t kMaxDeflateBufferSize = 2 * 1024 * 1024;
 
 using CreateObjectFunction = HRESULT (STDAPICALLTYPE *)(const GUID *, const GUID *, void **);
 using GetHandlerPropertyFunction = HRESULT (STDAPICALLTYPE *)(UInt32, PROPID, PROPVARIANT *);
 using GetNumberOfFormatsFunction = HRESULT (STDAPICALLTYPE *)(UInt32 *);
 using GetIsArcFunction = HRESULT (STDAPICALLTYPE *)(UInt32, Func_IsArc *);
+using SetDeflateInputBufferSizeFunction = HRESULT (STDAPICALLTYPE *)(UInt32);
 
 std::wstring FromUtf8(const std::string& value);
 
@@ -77,6 +83,7 @@ CreateObjectFunction g_createObject = nullptr;
 GetHandlerPropertyFunction g_getHandlerProperty = nullptr;
 GetNumberOfFormatsFunction g_getNumberOfFormats = nullptr;
 GetIsArcFunction g_getIsArc = nullptr;
+SetDeflateInputBufferSizeFunction g_setDeflateInputBufferSize = nullptr;
 class ExtractionPool;
 ExtractionPool *g_extractionPool = nullptr;
 
@@ -122,8 +129,11 @@ void EnsureEngineLoaded(const std::string& path)
 	g_getHandlerProperty = LoadEngineFunction<GetHandlerPropertyFunction>("GetHandlerProperty2");
 	g_getNumberOfFormats = LoadEngineFunction<GetNumberOfFormatsFunction>("GetNumberOfFormats");
 	g_getIsArc = LoadEngineFunction<GetIsArcFunction>("GetIsArc");
+	g_setDeflateInputBufferSize =
+		LoadEngineFunction<SetDeflateInputBufferSizeFunction>("SetDeflateInputBufferSize");
 	if (g_createObject == nullptr || g_getHandlerProperty == nullptr
-		|| g_getNumberOfFormats == nullptr || g_getIsArc == nullptr) {
+		|| g_getNumberOfFormats == nullptr || g_getIsArc == nullptr
+		|| g_setDeflateInputBufferSize == nullptr) {
 #ifdef _WIN32
 		::FreeLibrary(g_engineModule);
 #else
@@ -134,6 +144,7 @@ void EnsureEngineLoaded(const std::string& path)
 		g_getHandlerProperty = nullptr;
 		g_getNumberOfFormats = nullptr;
 		g_getIsArc = nullptr;
+		g_setDeflateInputBufferSize = nullptr;
 		throw std::runtime_error("The bundled 7-Zip engine is missing required exports");
 	}
 	g_enginePath = path;
@@ -571,6 +582,21 @@ struct OutputRequest {
 struct ReadRange {
 	std::uint64_t offset;
 	std::uint64_t length;
+};
+
+struct ExtractionProfile {
+	double validationMs = 0;
+	double reservationMs = 0;
+	double requestSetupMs = 0;
+	double contextAcquireMs = 0;
+	double solidCheckMs = 0;
+	double callbackSetupMs = 0;
+	double sevenZipExtractMs = 0;
+	double resultProcessingMs = 0;
+	double minSevenZipCallMs = 0;
+	double maxSevenZipCallMs = 0;
+	std::uint32_t sevenZipCalls = 0;
+	bool abortPerItem = false;
 };
 
 class FileInStream final : public IInStream, public CMyUnknownImp {
@@ -1367,11 +1393,13 @@ public:
 	void Open(
 		const std::string& path,
 		std::optional<std::string> password,
-		const std::string& enginePath)
+		const std::string& enginePath,
+		std::uint32_t deflateBufferSize)
 	{
 		EnsureEngineLoaded(enginePath);
 		path_ = path;
 		password_ = std::move(password);
+		deflateBufferSize_ = deflateBufferSize;
 		const auto extension = Extension(path);
 		UInt32 formatCount = 0;
 		if (g_getNumberOfFormats(&formatCount) != S_OK || formatCount == 0) {
@@ -1522,8 +1550,14 @@ public:
 	std::vector<std::vector<std::uint8_t>> Extract(
 		const std::vector<std::uint32_t>& ids,
 		const std::vector<ReadRange>& ranges,
-		OutputReservation& outputReservation)
+		OutputReservation& outputReservation,
+		ExtractionProfile *profile = nullptr)
 	{
+		using Clock = std::chrono::steady_clock;
+		const auto elapsedMs = [](Clock::time_point start) {
+			return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+		};
+		Clock::time_point phaseStart;
 		if (contexts_.empty()) {
 			throw std::runtime_error("Archive is closed");
 		}
@@ -1533,6 +1567,9 @@ public:
 		std::unordered_map<std::uint32_t, std::size_t> requestById;
 		requestById.reserve(ids.size());
 		std::uint64_t totalRequested = 0;
+		if (profile != nullptr) {
+			phaseStart = Clock::now();
+		}
 		for (std::size_t requestIndex = 0; requestIndex < ids.size(); ++requestIndex) {
 			const auto id = ids[requestIndex];
 			if (id >= entries_.size()) {
@@ -1555,7 +1592,15 @@ public:
 			}
 			totalRequested += requested;
 		}
+		if (profile != nullptr) {
+			profile->validationMs = elapsedMs(phaseStart);
+			phaseStart = Clock::now();
+		}
 		outputReservation.Acquire(totalRequested);
+		if (profile != nullptr) {
+			profile->reservationMs = elapsedMs(phaseStart);
+			phaseStart = Clock::now();
+		}
 		std::vector<OutputRequest> requests;
 		requests.reserve(ids.size());
 		for (std::size_t requestIndex = 0; requestIndex < ids.size(); ++requestIndex) {
@@ -1590,8 +1635,21 @@ public:
 			return std::vector<std::vector<std::uint8_t>>(ids.size());
 		}
 		std::sort(sortedIds.begin(), sortedIds.end());
+		if (profile != nullptr) {
+			profile->requestSetupMs = elapsedMs(phaseStart);
+			phaseStart = Clock::now();
+		}
 		auto context = AcquireContext();
+		if (profile != nullptr) {
+			profile->contextAcquireMs = elapsedMs(phaseStart);
+			phaseStart = Clock::now();
+		}
 		const bool abortPerItem = !ranges.empty() && !IsSolidArchive(context->archive);
+		if (profile != nullptr) {
+			profile->solidCheckMs = elapsedMs(phaseStart);
+			profile->abortPerItem = abortPerItem;
+			phaseStart = Clock::now();
+		}
 		if (abortPerItem) {
 			for (auto& request : requests) {
 				request.abortOnLimit = request.offset + request.length < request.entrySize;
@@ -1599,12 +1657,28 @@ public:
 		}
 		auto *extractCallbackObject = new ExtractCallback(requests, requestById, password_);
 		CMyComPtr<IArchiveExtractCallback> callback = extractCallbackObject;
+		if (profile != nullptr) {
+			profile->callbackSetupMs = elapsedMs(phaseStart);
+			phaseStart = Clock::now();
+		}
 		HRESULT result = S_OK;
+		if (g_setDeflateInputBufferSize(deflateBufferSize_) != S_OK) {
+			throw std::runtime_error("Unable to configure the Deflate input buffer");
+		}
 		if (abortPerItem) {
 			for (const auto id : sortedIds) {
 				const auto requestIndex = requestById.at(id);
 				const UInt32 itemId = id;
+				const auto callStart = profile != nullptr ? Clock::now() : Clock::time_point{};
 				const auto itemResult = context->archive->Extract(&itemId, 1, 0, callback);
+				if (profile != nullptr) {
+					const double callMs = elapsedMs(callStart);
+					if (profile->sevenZipCalls == 0 || callMs < profile->minSevenZipCallMs) {
+						profile->minSevenZipCallMs = callMs;
+					}
+					profile->maxSevenZipCallMs = std::max(profile->maxSevenZipCallMs, callMs);
+					++profile->sevenZipCalls;
+				}
 				if (itemResult == E_ABORT && requests[requestIndex].limitReached) {
 					requests[requestIndex].operationResult = NArchive::NExtract::NOperationResult::kOK;
 					continue;
@@ -1615,11 +1689,22 @@ public:
 				}
 			}
 		} else {
+			const auto callStart = profile != nullptr ? Clock::now() : Clock::time_point{};
 			result = context->archive->Extract(
 				sortedIds.empty() ? nullptr : sortedIds.data(),
 				static_cast<UInt32>(sortedIds.size()),
 				0,
 				callback);
+			if (profile != nullptr) {
+				const double callMs = elapsedMs(callStart);
+				profile->sevenZipCalls = 1;
+				profile->minSevenZipCallMs = callMs;
+				profile->maxSevenZipCallMs = callMs;
+			}
+		}
+		if (profile != nullptr) {
+			profile->sevenZipExtractMs = elapsedMs(phaseStart);
+			phaseStart = Clock::now();
 		}
 		if (result != S_OK) {
 			if (extractCallbackObject->PasswordRequested()) {
@@ -1643,6 +1728,9 @@ public:
 		for (const auto id : ids) {
 			resultData.push_back(std::move(requests[requestById.at(id)].data));
 		}
+		if (profile != nullptr) {
+			profile->resultProcessingMs = elapsedMs(phaseStart);
+		}
 		return resultData;
 	}
 
@@ -1661,6 +1749,9 @@ public:
 		auto *extractCallbackObject = new StreamingExtractCallback(id, stream, password_);
 		CMyComPtr<IArchiveExtractCallback> callback = extractCallbackObject;
 		const UInt32 itemIndex = id;
+		if (g_setDeflateInputBufferSize(deflateBufferSize_) != S_OK) {
+			throw std::runtime_error("Unable to configure the Deflate input buffer");
+		}
 		const auto result = context->archive->Extract(&itemIndex, 1, 0, callback);
 		if (result != S_OK) {
 			if (extractCallbackObject->PasswordRequested()) {
@@ -1804,6 +1895,7 @@ private:
 	FileStamp fileStamp_{};
 	std::optional<std::string> password_;
 	std::vector<Entry> entries_;
+	std::uint32_t deflateBufferSize_ = 32 * 1024;
 };
 
 Napi::Object EntryToJs(Napi::Env env, const Entry& entry)
@@ -1891,11 +1983,13 @@ public:
 		Napi::Promise::Deferred deferred,
 		std::string path,
 		std::optional<std::string> password,
-		std::string enginePath)
+		std::string enginePath,
+		std::uint32_t deflateBufferSize)
 		: BoundedAsyncWorker(env, deferred),
 			path_(std::move(path)),
 			password_(std::move(password)),
-			enginePath_(std::move(enginePath)) {}
+			enginePath_(std::move(enginePath)),
+			deflateBufferSize_(deflateBufferSize) {}
 
 	~OpenWorker() override
 	{
@@ -1908,7 +2002,7 @@ public:
 	{
 		try {
 			archive_ = std::make_shared<ArchiveEngine>();
-			archive_->Open(path_, std::move(password_), enginePath_);
+			archive_->Open(path_, std::move(password_), enginePath_, deflateBufferSize_);
 		} catch (const std::exception& error) {
 			SetError(error.what());
 		} catch (...) {
@@ -1930,6 +2024,7 @@ private:
 	std::string path_;
 	std::optional<std::string> password_;
 	std::string enginePath_;
+	std::uint32_t deflateBufferSize_;
 	std::shared_ptr<ArchiveEngine> archive_;
 };
 
@@ -1979,7 +2074,8 @@ public:
 			archive_(std::move(archive)),
 			ids_(std::move(ids)),
 			ranges_(std::move(ranges)),
-			singleOutput_(singleOutput) {}
+			singleOutput_(singleOutput),
+			profileEnabled_(std::getenv("ZIP_NATIVE_PROFILE_READ") != nullptr) {}
 
 	~ExtractWorker() override
 	{
@@ -1988,17 +2084,52 @@ public:
 
 	void Execute() noexcept override
 	{
+		std::chrono::steady_clock::time_point started;
+		if (profileEnabled_) {
+			started = std::chrono::steady_clock::now();
+		}
 		try {
-			outputs_ = archive_->Extract(ids_, ranges_, outputReservation_);
+			outputs_ = archive_->Extract(
+				ids_,
+				ranges_,
+				outputReservation_,
+				profileEnabled_ ? &profile_ : nullptr);
 		} catch (const std::exception& error) {
 			error_ = error.what();
 		} catch (...) {
 			error_ = "Unknown native extraction failure";
 		}
+		if (profileEnabled_) {
+			executionMs_ = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - started).count();
+		}
 	}
 
 	void Complete(Napi::Env env) override
 	{
+		if (profileEnabled_) {
+			std::fprintf(
+				stderr,
+				"[7zip-native profile] worker=%.3f ms, validation=%.3f, reservation=%.3f, "
+				"requestSetup=%.3f, contextAcquire=%.3f, solidCheck=%.3f, callbackSetup=%.3f, "
+				"sevenZipExtract=%.3f (%u calls; perItem=%d; callMin=%.3f; callMax=%.3f), "
+				"resultProcessing=%.3f, entries=%zu\n",
+				executionMs_,
+				profile_.validationMs,
+				profile_.reservationMs,
+				profile_.requestSetupMs,
+				profile_.contextAcquireMs,
+				profile_.solidCheckMs,
+				profile_.callbackSetupMs,
+				profile_.sevenZipExtractMs,
+				profile_.sevenZipCalls,
+				profile_.abortPerItem,
+				profile_.minSevenZipCallMs,
+				profile_.maxSevenZipCallMs,
+				profile_.resultProcessingMs,
+				ids_.size());
+			std::fflush(stderr);
+		}
 		try {
 			if (!error_.empty()) {
 				deferred_.Reject(Napi::Error::New(env, error_).Value());
@@ -2027,6 +2158,9 @@ private:
 	std::vector<std::uint32_t> ids_;
 	std::vector<ReadRange> ranges_;
 	bool singleOutput_;
+	bool profileEnabled_;
+	double executionMs_ = 0;
+	ExtractionProfile profile_;
 	std::vector<std::vector<std::uint8_t>> outputs_;
 	std::string error_;
 };
@@ -2317,9 +2451,19 @@ private:
 Napi::Value Open(const Napi::CallbackInfo& info)
 {
 	const auto env = info.Env();
-	if (info.Length() != 3 || !info[0].IsString()
-		|| (!info[1].IsUndefined() && !info[1].IsString()) || !info[2].IsString()) {
-		throw Napi::TypeError::New(env, "open(path, password?, enginePath) expects path, optional password, and engine path");
+	if (info.Length() != 4 || !info[0].IsString()
+		|| (!info[1].IsUndefined() && !info[1].IsString())
+		|| !info[2].IsString() || !info[3].IsNumber()) {
+		throw Napi::TypeError::New(
+			env, "open(path, password?, enginePath, deflateBufferSize) expects a path, optional password, engine path, and buffer size");
+	}
+	const double deflateBufferSizeValue = info[3].As<Napi::Number>().DoubleValue();
+	if (!std::isfinite(deflateBufferSizeValue)
+		|| std::floor(deflateBufferSizeValue) != deflateBufferSizeValue
+		|| deflateBufferSizeValue < kMinDeflateBufferSize
+		|| deflateBufferSizeValue > kMaxDeflateBufferSize) {
+		throw Napi::RangeError::New(
+			env, "Deflate buffer size must be an integer between 4096 and 2097152 bytes");
 	}
 	std::optional<std::string> password;
 	if (info[1].IsString()) {
@@ -2337,7 +2481,8 @@ Napi::Value Open(const Napi::CallbackInfo& info)
 		deferred,
 		info[0].As<Napi::String>().Utf8Value(),
 		std::move(password),
-		info[2].As<Napi::String>().Utf8Value());
+		info[2].As<Napi::String>().Utf8Value(),
+		static_cast<std::uint32_t>(deflateBufferSizeValue));
 	worker->Queue();
 	return deferred.Promise();
 }

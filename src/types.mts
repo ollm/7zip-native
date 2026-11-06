@@ -23,6 +23,7 @@ export interface ReadRequest extends ReadOptions {
 
 export interface OpenOptions {
 	readonly password?: string;
+	readonly deflateBufferSize?: number;
 }
 
 export type ArchiveFormat = '7z' | 'zip' | 'tar' | 'wim';

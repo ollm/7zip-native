@@ -1,0 +1,47 @@
+diff --git a/CPP/7zip/Archive/Archive2.def b/CPP/7zip/Archive/Archive2.def
+index 5abe81d..b96cb34 100644
+--- a/CPP/7zip/Archive/Archive2.def
++++ b/CPP/7zip/Archive/Archive2.def
+@@ -3,6 +3,7 @@ EXPORTS
+   GetHandlerProperty PRIVATE
+   GetNumberOfFormats PRIVATE
+   GetHandlerProperty2 PRIVATE
+   GetIsArc PRIVATE
++  SetDeflateInputBufferSize PRIVATE
+ 
+   GetNumberOfMethods PRIVATE
+   GetMethodProperty PRIVATE
+diff --git a/CPP/7zip/Compress/DeflateDecoder.cpp b/CPP/7zip/Compress/DeflateDecoder.cpp
+index 7993176..5f3d9d4 100644
+--- a/CPP/7zip/Compress/DeflateDecoder.cpp
++++ b/CPP/7zip/Compress/DeflateDecoder.cpp
+@@ -3,6 +3,20 @@
+ 
+ #include "DeflateDecoder.h"
+ 
++namespace {
++
++thread_local UInt32 g_deflateInputBufferSize = 1 << 15;
++
++}
++
++STDAPI SetDeflateInputBufferSize(UInt32 bufferSize)
++{
++  if (bufferSize < (1 << 12) || bufferSize > (1 << 20))
++    return E_INVALIDARG;
++  g_deflateInputBufferSize = bufferSize;
++  return S_OK;
++}
++
+ namespace NCompress {
+ namespace NDeflate {
+ namespace NDecoder {
+@@ -153,7 +167,7 @@ HRESULT CCoder::InitInStream(bool needInit)
+     // for HDD-Windows:
+     // (1 << 15) - best for reading only prefetch
+     // (1 << 22) - best for real reading / writing
+-    if (!m_InBitStream.Create(1 << 20))
++    if (!m_InBitStream.Create(g_deflateInputBufferSize))
+       return E_OUTOFMEMORY;
+     m_InBitStream.Init();
+     _needInitInStream = false;

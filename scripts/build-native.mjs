@@ -1,11 +1,12 @@
 import {spawn} from 'node:child_process';
-import { copyFile, mkdir, rm } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rm } from 'node:fs/promises';
 import {createRequire} from 'node:module';
 import {availableParallelism} from 'node:os';
 import { join, resolve } from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
+const upstreamDirectory = join(root, 'vendor', '7zip');
 const bundleDirectory = join(root, 'vendor', '7zip', 'CPP', '7zip', 'Bundles', 'Format7zF');
 const releaseDirectory = join(root, 'build', 'Release');
 const targetArch = process.env.BUILD_ARCH || process.arch;
@@ -14,6 +15,9 @@ const engineName = process.platform === 'win32'
 	? '7z.dll'
 	: process.platform === 'darwin' ? 'lib7z.dylib' : '7z.so';
 const require = createRequire(import.meta.url);
+const patchPath = join(root, 'patches', 'deflate-input-buffer-size.patch');
+const deflateSourcePath = join(upstreamDirectory, 'CPP', '7zip', 'Compress', 'DeflateDecoder.cpp');
+const archiveExportsPath = join(upstreamDirectory, 'CPP', '7zip', 'Archive', 'Archive2.def');
 
 function run(command, args, cwd, env = process.env)
 {
@@ -31,6 +35,21 @@ function run(command, args, cwd, env = process.env)
 			}
 		});
 	});
+}
+
+const deflateSource = await readFile(deflateSourcePath, 'utf8');
+const archiveExports = await readFile(archiveExportsPath, 'utf8');
+if(deflateSource.includes('SetDeflateInputBufferSize'))
+{
+	if(!archiveExports.includes('SetDeflateInputBufferSize'))
+	{
+		throw new Error('The Deflate buffer patch is only partially applied; restore vendor/7zip and rebuild');
+	}
+}
+else
+{
+	await run('git', ['-C', upstreamDirectory, 'apply', '--check', patchPath], root);
+	await run('git', ['-C', upstreamDirectory, 'apply', patchPath], root);
 }
 
 if(process.platform === 'win32')

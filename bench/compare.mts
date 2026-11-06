@@ -35,12 +35,12 @@ if(!Number.isSafeInteger(parallelConcurrency) || parallelConcurrency < 1 || para
 }
 
 const require = createRequire(import.meta.url);
-const binaryPackage = require('7zip-bin-full') as {path7z?: unknown};
-if(typeof binaryPackage.path7z !== 'string')
+const binaryPackage = require('7zip-bin-full') as {path7zc?: unknown};
+if(typeof binaryPackage.path7zc !== 'string')
 {
-	throw new TypeError('7zip-bin-full does not provide a path7z binary for this platform');
+	throw new TypeError('7zip-bin-full does not provide a path7zc binary for this platform');
 }
-const binaryPath = binaryPackage.path7z;
+const binaryPath = binaryPackage.path7zc;
 
 function runCli(args: readonly string[], outputLimit = maxCapturedBytes): Promise<Buffer>
 {
@@ -142,10 +142,18 @@ function cliList(): Promise<CliEntry[]>
 	return runCli(['l', '-slt', '-sccUTF-8', archivePath]).then(parseCliEntries);
 }
 
-function cliExtract(paths: readonly string[], outputLimit = maxCapturedBytes): Promise<Buffer>
+function cliExtract(
+	paths: readonly string[],
+	outputLimit = maxCapturedBytes,
+	byteLimit?: number,
+): Promise<Buffer>
 {
-	return runCli([
-		'x',
+	const args = ['x'];
+	if(byteLimit !== undefined)
+	{
+		args.push(`-slb${byteLimit}`);
+	}
+	args.push(
 		archivePath,
 		...paths,
 		'-so',
@@ -154,7 +162,8 @@ function cliExtract(paths: readonly string[], outputLimit = maxCapturedBytes): P
 		'-bb0',
 		'-spd',
 		'-sccUTF-8',
-	], outputLimit);
+	);
+	return runCli(args, outputLimit);
 }
 
 function isGroupedExtractionResult(value: BenchmarkResult): value is GroupedExtractionResult
@@ -502,7 +511,7 @@ try
 		));
 	}
 
-	const rangeNote = '7zip-bin-full decompresses the whole entry and slices stdout; it has no ranged-read API';
+	const rangeNote = '7zzc uses -slb; non-solid archives abort per item, while ranges emit through offset + length and slice stdout';
 	for(const [name, offset, length] of [
 		['read_prefix', 0n, prefixLength],
 		['read_range_at_one_third', rangeOffset, rangeLength],
@@ -515,8 +524,13 @@ try
 		}
 		const nativeRead = () => archive.read(file.id, {offset, length});
 		const cliRead = async () => {
-			const full = await cliExtract([file.path], Number(file.size));
-			return full.subarray(Number(offset), Number(offset + length));
+			if(length === 0n)
+			{
+				return Buffer.alloc(0);
+			}
+			const limit = Number(offset + length);
+			const output = await cliExtract([file.path], limit, limit);
+			return output.subarray(Number(offset), limit);
 		};
 		results.push(await measurePair(name, nativeRead, cliRead));
 	}
