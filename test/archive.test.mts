@@ -303,6 +303,30 @@ test('opens, indexes, partially reads, and extracts ZIP entries', async () => {
 	}
 });
 
+test('indexes getEntry lookups by path and ID while preserving exact-match behavior', async () => {
+	const indexArchivePath = join(directory, 'entry-index.zip');
+	await writeFile(indexArchivePath, makeStoredZip([
+		{name: '__proto__', data: 'prototype path'},
+		{name: 'constructor', data: 'constructor path'},
+		{name: 'duplicate.txt', data: 'first'},
+		{name: 'duplicate.txt', data: 'second'},
+	]));
+	const archive = await Archive.open(indexArchivePath);
+	try
+	{
+		const entries = await archive.entries();
+		assert.equal((await archive.getEntry('__proto__'))?.id, entries[0]!.id);
+		assert.equal((await archive.getEntry('constructor'))?.id, entries[1]!.id);
+		assert.equal((await archive.getEntry('duplicate.txt'))?.id, entries[2]!.id);
+		assert.equal((await archive.getEntry(entries[3]!.id))?.id, entries[3]!.id);
+		assert.equal(await archive.getEntry('missing.txt'), undefined);
+	}
+	finally
+	{
+		await archive.close();
+	}
+});
+
 test('configures the Deflate input buffer per archive and validates its range', async () => {
 	const archivePath = join(sampleDirectory, 'sample.zip');
 	const archive = await Archive.open(archivePath);

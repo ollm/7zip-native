@@ -507,6 +507,10 @@ class NativeArchiveReadable extends Readable {
 export class Archive {
 	private closed = false;
 	private entriesPromise?: Promise<readonly ArchiveEntry[]>;
+	private entryIndexes?: {
+		readonly pathEntries: Readonly<Record<string, ArchiveEntry>>;
+		readonly idEntries: Readonly<Record<number, ArchiveEntry>>;
+	};
 
 	private constructor(private readonly handle: bigint) {}
 
@@ -711,8 +715,27 @@ export class Archive {
 		{
 			throw new RangeError('Entry ID must be a non-negative safe integer');
 		}
-		return (await this.entries()).find(entry =>
-			typeof idOrPath === 'number' ? entry.id === idOrPath : entry.path === idOrPath);
+		const entries = await this.entries();
+		if(!this.entryIndexes)
+		{
+			const pathEntries = Object.create(null) as Record<string, ArchiveEntry>;
+			const idEntries = Object.create(null) as Record<number, ArchiveEntry>;
+			for(const entry of entries)
+			{
+				pathEntries[entry.path] ??= entry;
+				idEntries[entry.id] ??= entry;
+			}
+			this.entryIndexes = {pathEntries, idEntries};
+		}
+		if(typeof idOrPath === 'number')
+		{
+			return this.entryIndexes.idEntries[idOrPath];
+		}
+		if(typeof idOrPath === 'string')
+		{
+			return this.entryIndexes.pathEntries[idOrPath];
+		}
+		return undefined;
 	}
 
 	async extract(idOrPath: EntrySelector): Promise<Buffer>;
