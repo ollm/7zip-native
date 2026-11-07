@@ -594,7 +594,7 @@ test('sanitizes Windows output paths without changing path selectors or entry me
 	assert.equal(
 		entry.extractedPath,
 		process.platform === 'win32'
-			? join('folder__', 'bad_name__')
+			? join('folder__', 'bad__________')
 			: join('folder. ', 'bad<>\t:|?*". '),
 	);
 	assert.equal(reservedEntry.extractedPath, process.platform === 'win32' ? '_CON.txt' : 'CON.txt');
