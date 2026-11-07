@@ -294,7 +294,7 @@ Windows x86 (ia32) is not supported by the published prebuilt binaries.
 
 ## Electron
 
-The addon uses Node-API, but the addon and 7-Zip engine still need to match the Electron application's operating system and architecture. Use a matching package prebuild when available, or rebuild for the Electron version and target architecture using your Electron build tooling.
+The addon uses Node-API, but the addon and 7-Zip engine still need to match the Electron application's operating system and architecture. Use a matching package prebuild when available, or rebuild for the Electron version and target architecture using your Electron build tooling. The engine is loaded at runtime rather than linked into the addon, so ensure the matching engine library is included alongside the addon.
 
 When packaging with ASAR, ensure both `7zip_native.node` and the matching engine library (`7z.dll`, `7z.so`, or `lib7z.dylib`) are physically unpacked and that the runtime paths resolve to those unpacked files. For `electron-builder`, an `asarUnpack` configuration can include:
 

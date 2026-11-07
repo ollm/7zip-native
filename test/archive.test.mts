@@ -1243,6 +1243,38 @@ for(const archiveName of sampleArchives)
 	});
 }
 
+for(const [sourceName, alias] of [
+	['sample.7z', 'sample.cb7'],
+	['sample.rar', 'sample.cbr'],
+	['sample.rar', 'sample-rar.zip'],
+	['sample.zip', 'sample-zip.rar'],
+	['sample.tar', 'sample-tar.zip'],
+] as const)
+{
+	test(`opens and extracts ${alias} by archive content`, async () => {
+		const archivePath = join(directory, alias);
+		const outputPath = join(directory, `${alias}.output`);
+		await copyFile(join(sampleDirectory, sourceName), archivePath);
+		const archive = await Archive.open(archivePath);
+		try
+		{
+			const entries = await archive.entries();
+			const entry = entries.find(item => !item.isDirectory);
+			assert.ok(entry, `${alias}: expected at least one file`);
+			await archive.extractToFolder(outputPath, {ids: [entry.id]});
+			assert.deepEqual(
+				await readFile(join(outputPath, entry.extractedPath)),
+				await readFile(join(sampleDirectory, entry.path)),
+				`${alias}: ${entry.path}`,
+			);
+		}
+		finally
+		{
+			await archive.close();
+		}
+	});
+}
+
 for(const archiveName of truncatedSampleArchives)
 {
 	test(`lists and extracts the first file from ${archiveName}`, async () => {

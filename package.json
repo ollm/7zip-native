@@ -1,6 +1,6 @@
 {
 	"name": "7zip-native",
-	"version": "0.0.14",
+	"version": "0.0.15",
 	"description": "Native 7zip bindings for Node.js",
 	"main": "./dist/index.cjs",
 	"type": "module",
@@ -65,9 +65,20 @@
 	},
 	"keywords": [
 		"7zip",
+		"7-zip",
+		"archive",
 		"nodejs",
 		"bindings",
-		"native"
+		"native",
+		"node-api",
+		"napi",
+		"zip",
+		"rar",
+		"tar",
+		"wim",
+		"compression",
+		"decompression",
+		"extraction"
 	],
 	"devDependencies": {
 		"@eslint/js": "^10.0.1",

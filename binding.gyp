@@ -15,20 +15,20 @@
 			"cflags_cc!": ["-fno-exceptions"],
 			"conditions": [
 				["OS=='linux'", {
+					"sources": [
+						"vendor/7zip/CPP/Common/MyWindows.cpp",
+						"vendor/7zip/CPP/Windows/PropVariant.cpp"
+					],
 					"cflags_cc": ["-pthread"],
 					"libraries": [
 						"-pthread",
-						"-ldl",
-						"-L<(module_root_dir)/vendor/7zip/CPP/7zip/Bundles/Format7zF/_o",
-						"-l:7z.so",
-						"-Wl,-rpath,'$$ORIGIN'"
+						"-ldl"
 					]
 				}],
 				["OS=='mac'", {
-					"libraries": [
-						"-L<(module_root_dir)/vendor/7zip/CPP/7zip/Bundles/Format7zF/_o",
-						"-l7z",
-						"-Wl,-rpath,@loader_path"
+					"sources": [
+						"vendor/7zip/CPP/Common/MyWindows.cpp",
+						"vendor/7zip/CPP/Windows/PropVariant.cpp"
 					],
 					"xcode_settings": {
 						"CLANG_CXX_LANGUAGE_STANDARD": "c++17",

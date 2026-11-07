@@ -2160,12 +2160,12 @@ public:
 			GUID classId;
 			std::string name;
 			bool extensionMatch;
-			bool hasSignatureFunction;
-			bool signatureMatch;
+			bool contentMatch;
+			unsigned probePriority;
 		};
 		std::vector<Format> formats;
 		formats.reserve(formatCount);
-		std::vector<Byte> header(64 * 1024);
+		std::vector<Byte> header(1 << 20);
 		auto *probeFile = new FileInStream();
 		CMyComPtr<IInStream> probe = probeFile;
 		if (!probeFile->Open(path)) {
@@ -2178,6 +2178,8 @@ public:
 		if (headerSize == 0) {
 			throw std::runtime_error("Archive file is empty");
 		}
+		const bool endOfFile = headerSize < header.size()
+			|| GetFileStamp(path).size <= headerSize;
 		for (UInt32 i = 0; i < formatCount; ++i) {
 			NWindows::NCOM::CPropVariant classIdValue;
 			if (g_getHandlerProperty(i, NArchive::NHandlerPropID::kClassID, &classIdValue) != S_OK
@@ -2207,38 +2209,95 @@ public:
 			}
 			Func_IsArc isArchive = nullptr;
 			const bool hasSignatureFunction = g_getIsArc(i, &isArchive) == S_OK && isArchive != nullptr;
-			const bool signatureMatch = hasSignatureFunction
-				&& isArchive(header.data(), header.size()) != 0;
-			formats.push_back({i, classId, std::move(name), match, hasSignatureFunction, signatureMatch});
-		}
-		const bool hasSignatureMatch = std::any_of(
-			formats.begin(), formats.end(), [](const Format& format) { return format.signatureMatch; });
-		const bool hasExtensionMatch = std::any_of(
-			formats.begin(), formats.end(), [](const Format& format) { return format.extensionMatch; });
-		if (hasSignatureMatch) {
-			formats.erase(
-				std::remove_if(formats.begin(), formats.end(), [](const Format& format) {
-					return !format.signatureMatch
-						&& !(format.extensionMatch && !format.hasSignatureFunction);
-				}),
-				formats.end());
-		} else if (hasExtensionMatch && std::any_of(
-			formats.begin(), formats.end(), [](const Format& format) {
-				return format.extensionMatch && !format.hasSignatureFunction;
-			})) {
-			formats.erase(
-				std::remove_if(formats.begin(), formats.end(), [](const Format& format) {
-					return !format.extensionMatch || format.hasSignatureFunction;
-				}),
-				formats.end());
-		} else if (hasExtensionMatch) {
-			formats.clear();
+			constexpr UInt32 kStartOpenFlags =
+				NArcInfoFlags::kStartOpen
+				| NArcInfoFlags::kPureStartOpen
+				| NArcInfoFlags::kBackwardOpen;
+			NWindows::NCOM::CPropVariant flagsValue;
+			const bool hasFlags = g_getHandlerProperty(
+				i, NArchive::NHandlerPropID::kFlags, &flagsValue) == S_OK
+				&& flagsValue.vt == VT_UI4;
+			const UInt32 flags = hasFlags ? flagsValue.ulVal : 0;
+			if (!match && (flags & NArcInfoFlags::kByExtOnlyOpen) != 0) {
+				continue;
+			}
+
+			bool contentMatch = false;
+			unsigned probePriority = match ? 0 : 2;
+			if (hasSignatureFunction) {
+				const auto result = isArchive(header.data(), headerSize);
+				contentMatch = result == k_IsArc_Res_YES
+					|| (result == k_IsArc_Res_NEED_MORE && !endOfFile);
+				if (!match && contentMatch) {
+					probePriority = 1;
+				} else if (!match && !contentMatch) {
+					continue;
+				}
+			} else {
+				NWindows::NCOM::CPropVariant signatureOffsetValue;
+				UInt32 signatureOffset = 0;
+				if (g_getHandlerProperty(
+					i, NArchive::NHandlerPropID::kSignatureOffset, &signatureOffsetValue) == S_OK
+					&& signatureOffsetValue.vt == VT_UI4) {
+					signatureOffset = signatureOffsetValue.ulVal;
+				}
+				std::vector<std::vector<Byte>> signatures;
+				NWindows::NCOM::CPropVariant signatureValue;
+				if (g_getHandlerProperty(i, NArchive::NHandlerPropID::kSignature, &signatureValue) == S_OK
+					&& signatureValue.vt == VT_BSTR
+					&& ::SysStringByteLen(signatureValue.bstrVal) != 0) {
+					const auto *data = reinterpret_cast<const Byte *>(signatureValue.bstrVal);
+					const auto size = ::SysStringByteLen(signatureValue.bstrVal);
+					signatures.emplace_back(data, data + size);
+				} else {
+					NWindows::NCOM::CPropVariant multiSignatureValue;
+					if (g_getHandlerProperty(
+						i, NArchive::NHandlerPropID::kMultiSignature, &multiSignatureValue) == S_OK
+						&& multiSignatureValue.vt == VT_BSTR) {
+						const auto *data = reinterpret_cast<const Byte *>(multiSignatureValue.bstrVal);
+						const auto size = ::SysStringByteLen(multiSignatureValue.bstrVal);
+						for (UINT offset = 0; offset < size;) {
+							const auto signatureSize = data[offset++];
+							if (signatureSize > size - offset) {
+								signatures.clear();
+								break;
+							}
+							signatures.emplace_back(data + offset, data + offset + signatureSize);
+							offset += signatureSize;
+						}
+					}
+				}
+
+				bool signatureMatch = false;
+				bool needCheck = !hasFlags || signatures.empty()
+					|| (flags & kStartOpenFlags) != 0 || signatureOffset != 0;
+				const auto signatureOffsetSize = static_cast<std::size_t>(signatureOffset);
+				for (const auto& signature : signatures) {
+					if (signatureOffsetSize > headerSize
+						|| signature.size() > headerSize - signatureOffsetSize) {
+						if (!endOfFile) {
+							needCheck = true;
+						}
+					} else if (std::memcmp(
+						header.data() + signatureOffsetSize, signature.data(), signature.size()) == 0) {
+						signatureMatch = true;
+						break;
+					}
+				}
+				contentMatch = signatureMatch;
+				if (!match && signatureMatch) {
+					probePriority = 1;
+				} else if (!match && !needCheck) {
+					continue;
+				}
+			}
+			formats.push_back({i, classId, std::move(name), match, contentMatch, probePriority});
 		}
 		if (formats.empty()) {
 			throw std::runtime_error("No registered 7-Zip handler recognizes this archive");
 		}
 		std::stable_sort(formats.begin(), formats.end(), [](const Format& left, const Format& right) {
-			return left.extensionMatch && !right.extensionMatch;
+			return left.probePriority < right.probePriority;
 		});
 
 		bool passwordRequested = false;
@@ -2266,6 +2325,11 @@ public:
 			lastOpenResult = candidate->Open(input, &maxCheckStartPosition, openCallback);
 			if (lastOpenResult != S_OK) {
 				passwordRequested = passwordRequested || openCallbackObject->PasswordRequested();
+				candidate->Close();
+				continue;
+			}
+			if (!HasValidEntryPaths(candidate) && !format.contentMatch
+				&& LowerAscii(format.name) != "gzip") {
 				candidate->Close();
 				continue;
 			}
@@ -2636,6 +2700,20 @@ public:
 	}
 
 private:
+	bool HasValidEntryPaths(IInArchive *archive) const
+	{
+		UInt32 count = 0;
+		if (archive->GetNumberOfItems(&count) != S_OK || count > kMaxEntries) {
+			return false;
+		}
+		for (UInt32 i = 0; i < count; ++i) {
+			if (GetPropString(archive, i, kpidPath).empty()) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	ContextLease AcquireContext()
 	{
 		std::unique_lock<std::mutex> lock(contextMutex_);
