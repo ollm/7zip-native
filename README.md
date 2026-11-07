@@ -192,7 +192,7 @@ It also accepts these options:
 - `compressionLevel`: Integer from 0 to 9; defaults to 5 and applies only to ZIP and 7z. TAR is uncompressed; WIM uses the upstream handler's default settings.
 - `overwrite`: Defaults to `false`. When `true`, an existing output file is replaced after the new archive has been written.
 
-Duplicate, unsafe, or conflicting internal paths are rejected. The output is first written to a temporary file beside the destination, then installed atomically, so an existing file is preserved if archive creation fails. Archive creation runs in the bounded native worker pool and does not launch a 7-Zip executable.
+Duplicate, absolute, or traversal paths are rejected, but platform-supported filename characters such as trailing spaces are preserved in the archive-internal path. The output is first written to a temporary file beside the destination, then installed atomically, so an existing file is preserved if archive creation fails. Archive creation runs in the bounded native worker pool and does not launch a 7-Zip executable.
 
 ### Extracting to a folder
 
@@ -221,7 +221,7 @@ await archive.extractToFolder('./unpacked', {
 
 Each native extraction call receives a batch of entry IDs and output paths. The addon queues disk writes asynchronously while 7-Zip continues extracting later entries; `onExtract` runs after that file's queued writes have completed and the file is closed. File contents are not streamed through Node.js or Electron. The `extractToFolder()` promise resolves after all `onExtract` callbacks have run.
 
-On Windows only, invalid filename characters (`< > : | ? * "`) and trailing dots/spaces in each destination component are replaced with `_`; selectors and entry metadata remain unchanged. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
+On Windows only, unsupported filename characters (including control characters), trailing dots/spaces in each destination component, and reserved device names are normalized for the output path; selectors and entry metadata remain unchanged. On Linux and macOS, platform-supported filename characters are preserved. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 
 ### Concurrency
 

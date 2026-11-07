@@ -173,20 +173,42 @@ function safeEntrySegments(entryPath: string): string[]
 		throw new ArchiveError('ERR_ARCHIVE_PATH', 'Archive entry path contains a null byte');
 	}
 	const normalized = entryPath.replace(/\\/g, '/');
-	if(normalized.startsWith('/') || /^[a-zA-Z]:/.test(normalized))
+	if(normalized.startsWith('/') || /^[a-zA-Z]:\//.test(normalized))
 	{
 		throw new ArchiveError('ERR_ARCHIVE_PATH', `Archive entry path is absolute: ${entryPath}`);
 	}
 	const segments = normalized.split('/').filter(segment => segment !== '' && segment !== '.');
-	if(segments.length === 0 || segments.some(segment =>
-		segment === '..'
-		|| segment.includes(':')
-		|| /[. ]$/.test(segment)
-		|| /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(segment)))
+	if(segments.length === 0 || segments.some(segment => segment === '..'))
 	{
 		throw new ArchiveError('ERR_ARCHIVE_PATH', `Unsafe archive entry path: ${entryPath}`);
 	}
 	return segments;
+}
+
+function sanitizeWindowsSegment(segment: string): string
+{
+	if(segment === '.' || segment === '..')
+	{
+		return segment;
+	}
+	const sanitized = [...segment].map(character =>
+		character.charCodeAt(0) < 0x20 || '<>:|?*"'.includes(character) ? '_' : character,
+	).join('')
+		.replace(/[. ]+$/g, trailing => '_'.repeat(trailing.length));
+	const reservedName = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])/i.exec(sanitized);
+	if(reservedName)
+	{
+		let index = reservedName[0].length;
+		while(sanitized[index] === ' ')
+		{
+			index++;
+		}
+		if(index === sanitized.length || sanitized[index] === '.')
+		{
+			return `_${sanitized}`;
+		}
+	}
+	return sanitized;
 }
 
 function sanitizeOutputPath(entryPath: string): string
@@ -195,19 +217,15 @@ function sanitizeOutputPath(entryPath: string): string
 	{
 		return entryPath;
 	}
-	return entryPath
-		.replace(/([. ]+)([\\/]|$)/g, (_match, unsupported: string, separator: string) =>
-			'_'.repeat(unsupported.length) + separator)
-		.replace(/[<>:|?*"]/g, '_');
+	return entryPath.replace(/\\/g, '/').split('/').map(sanitizeWindowsSegment).join('/');
 }
 
 function assertSafeRelativeArchivePath(entryPath: string): void
 {
 	const normalized = entryPath.replace(/\\/g, '/');
 	const segments = normalized.split('/').filter(segment => segment !== '' && segment !== '.');
-	if(entryPath.includes('\0')
-		|| normalized.startsWith('/')
-		|| /^[a-zA-Z]:/.test(normalized)
+	if(normalized.startsWith('/')
+		|| /^[a-zA-Z]:\//.test(normalized)
 		|| segments.length === 0
 		|| segments.some(segment => segment === '..'))
 	{

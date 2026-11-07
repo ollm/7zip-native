@@ -249,6 +249,24 @@ test('creates archives atomically, enforces overwrite, and validates entry paths
 	);
 });
 
+test('creates archive entries with trailing spaces in their names', async () => {
+	const sourcePath = join(directory, 'trailing-space-source.txt');
+	const outputPath = join(directory, 'trailing-space-entry.zip');
+	const entryPath = 'chapter/page:name.txt ';
+	await writeFile(sourcePath, 'trailing space');
+	await Archive.create(outputPath, [{sourcePath, path: entryPath}]);
+	const archive = await Archive.open(outputPath);
+	try
+	{
+		const entries = await archive.entries();
+		assert.deepEqual(entries.map(entry => entry.path), [entryPath]);
+	}
+	finally
+	{
+		await archive.close();
+	}
+});
+
 test('preserves source modification times in 7z archives', async () => {
 	const sourcePath = join(directory, 'timestamp-source.txt');
 	const outputPath = join(directory, 'timestamp-preserved.7z');
@@ -564,14 +582,19 @@ test('waits for all file completion callbacks across concurrent archive instance
 
 test('sanitizes Windows output paths without changing path selectors or entry metadata', async () => {
 	const archivePath = join(directory, 'windows-output-paths.zip');
-	const internalPath = 'folder. /bad<>:|?*". ';
-	await writeFile(archivePath, makeStoredZip([{name: internalPath, data: 'sanitized'}]));
+	const internalPath = 'folder. /bad<>\t:|?*". ';
+	await writeFile(archivePath, makeStoredZip([
+		{name: internalPath, data: 'sanitized'},
+		{name: 'CON.txt', data: 'reserved'},
+	]));
 	const archive = await Archive.open(archivePath);
-	const [entry] = await archive.entries();
+	const [entry, reservedEntry] = await archive.entries();
 	assert.ok(entry);
+	assert.ok(reservedEntry);
 	const byPathDestination = join(directory, 'windows-output-by-path');
 	const byIdDestination = join(directory, 'windows-output-by-id');
-	const sanitizedPath = join(byPathDestination, 'folder__', 'bad_________');
+	const reservedDestination = join(directory, 'windows-output-reserved');
+	const sanitizedPath = join(byPathDestination, 'folder__', 'bad__________');
 	try
 	{
 		await withPlatform('win32', async () => {
@@ -582,13 +605,39 @@ test('sanitizes Windows output paths without changing path selectors or entry me
 			});
 			assert.deepEqual(events, [{entry, outputPath: sanitizedPath, percent: 100}]);
 			await archive.extractToFolder(byIdDestination, {ids: [entry.id]});
+			await archive.extractToFolder(reservedDestination, {ids: [reservedEntry.id]});
 		});
 		assert.equal((await readFile(sanitizedPath)).toString(), 'sanitized');
 		assert.equal(
-			(await readFile(join(byIdDestination, 'folder__', 'bad_________'))).toString(),
+			(await readFile(join(byIdDestination, 'folder__', 'bad__________'))).toString(),
 			'sanitized',
 		);
+		assert.equal((await readFile(join(reservedDestination, '_CON.txt'))).toString(), 'reserved');
 		assert.equal(entry.path, internalPath);
+		assert.equal(reservedEntry.path, 'CON.txt');
+	}
+	finally
+	{
+		await archive.close();
+	}
+});
+
+test('preserves platform-supported output path characters outside Windows', async () => {
+	const archivePath = join(directory, 'platform-supported-output-paths.zip');
+	const internalPath = 'folder. /bad:name. ';
+	await writeFile(archivePath, makeStoredZip([{name: internalPath, data: 'preserved'}]));
+	const archive = await Archive.open(archivePath);
+	try
+	{
+		for(const platform of ['linux', 'darwin'])
+		{
+			const destination = join(directory, `${platform}-output-paths`);
+			await withPlatform(platform, () => archive.extractToFolder(destination));
+			assert.equal(
+				(await readFile(join(destination, 'folder. ', 'bad:name. '))).toString(),
+				'preserved',
+			);
+		}
 	}
 	finally
 	{
