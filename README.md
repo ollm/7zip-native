@@ -10,13 +10,37 @@ Native Node-API bindings for the 7-Zip archive engine. Use a typed, Promise-base
 
 The package includes the native addon and the matching 7-Zip engine for each supported target. Compression and decompression are provided by the upstream 7-Zip implementation.
 
+## Contents
+
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [API](#api)
+  - [`Archive.open()`](#archiveopen)
+  - [`archive.entries()`](#archiveentries)
+  - [`archive.getEntry()`](#archivegetentry)
+  - [`archive.extractToFolder()`](#archiveextracttofolder)
+  - [`archive.extract()`](#archiveextract)
+  - [`archive.read()`](#archiveread)
+  - [`archive.createReadStream()`](#archivecreatereadstream)
+  - [`archive.extractToStream()`](#archiveextracttostream)
+  - [`Archive.create()`](#archivecreate)
+  - [`Archive.concurrency()`](#archiveconcurrency)
+  - [`archive.close()`](#archiveclose)
+- [Errors and limits](#errors-and-limits)
+- [Supported formats](#supported-formats)
+- [Platform support](#platform-support)
+- [Electron](#electron)
+- [Build from source](#build-from-source)
+- [Benchmarks](#benchmarks)
+- [License](#license)
+
 ## Installation
 
 ```sh
 npm install 7zip-native
 ```
 
-The package requires Node.js 18 or newer.
+The package requires Node.js 18.14.0 or newer.
 
 ## Quick start
 
@@ -55,7 +79,7 @@ const {Archive} = require('7zip-native');
 
 ## API
 
-### `Archive.open(path, options?)`
+### `Archive.open()`
 
 Opens an archive from a filesystem path and indexes its metadata asynchronously.
 
@@ -65,24 +89,20 @@ const archive = await Archive.open('./archive.7z', {password: 'secret'});
 
 `Archive.open()` accepts these options:
 
-- `password`: Passed to the upstream handler if it requests a password. It is held for the lifetime of the archive handle, is not logged, and is limited to 1 MiB of UTF-8 data.
-- `deflateBufferSize`: Input buffer size in bytes for Deflate extraction. Defaults to `32768`; accepts integers from `4096` through `2097152`. It is stored per archive and applied to each extraction, so different open archives can use different values.
+- `password`: Optional; not set by default. Passed to the upstream handler if it requests a password. It is held for the lifetime of the archive handle, is not logged, and is limited to 1 MiB of UTF-8 data.
+- `deflateBufferSize`: Input buffer size in bytes for Deflate extraction. Default: `32 KiB`; accepts integers from `4 KiB` through `2 MiB`. It is stored per archive and applied to each extraction, so different open archives can use different values.
 
 ```ts
-const archive = await Archive.open('./archive.zip', {deflateBufferSize: 32768});
+const archive = await Archive.open('./archive.zip', {deflateBufferSize: 256 * 1024});
 ```
 
-### Listing and looking up entries
+### `archive.entries()`
 
 ```ts
 const entries = await archive.entries();
-const byPath = await archive.getEntry('folder/page.jpg');
-const byId = await archive.getEntry(0);
 ```
 
-`entries()` returns cached metadata. Entry IDs are zero-based and stable for the lifetime of the opened archive. `getEntry()` returns `undefined` if the ID or full path does not match.
-
-All entry-targeted methods accept either the entry's numeric `id` or its exact archive-internal `path`: `extract()`, `read()`, `createReadStream()`, and `extractToStream()`. Batch `extract()` calls can mix IDs and paths. For folder extraction, use either the `ids` or `paths` option; omit both to extract every entry.
+`entries()` returns cached metadata. Entry IDs are zero-based and stable for the lifetime of the opened archive.
 
 Each entry includes:
 
@@ -98,12 +118,22 @@ Each entry includes:
 | `attributes` | `number` | Format-specific attributes |
 | `crc` | `number \| undefined` | CRC when supplied by the format |
 
-### Extracting to a folder
+### `archive.getEntry()`
+
+```ts
+const byPath = await archive.getEntry('folder/page.jpg');
+const byId = await archive.getEntry(0);
+```
+
+`getEntry()` returns `undefined` if the ID or full path does not match.
+
+All entry-targeted methods accept either the entry's numeric `id` or its exact archive-internal `path`: `extract()`, `read()`, `createReadStream()`, and `extractToStream()`. Batch `extract()` calls can mix IDs and paths. For folder extraction, use either the `ids` or `paths` option; omit both to extract every entry.
+
+### `archive.extractToFolder()`
 
 ```ts
 await archive.extractToFolder('./unpacked', {
 	paths: ['chapter/page1.jpg', 'chapter/page2.jpg'], // alternatively, use ids
-	concurrency: 2,
 	overwrite: true,
 	onExtract: ({entry, outputPath, percent}) => {
 		console.log(`Extracted ${entry.path} to ${outputPath} (${percent}%)`);
@@ -115,19 +145,19 @@ await archive.extractToFolder('./unpacked', {
 
 `extractToFolder()` accepts these options:
 
-- `ids`: Entry IDs to extract. Omit both `ids` and `paths` to extract every entry.
-- `paths`: Exact, original archive paths to extract, using `/` separators. This cannot be combined with `ids`.
-- `concurrency`: Maximum number of native extraction batches this call runs simultaneously. Must be an integer from 1 to 128; defaults to 1 and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`.
-- `overwrite`: Defaults to `false`, so existing files are not overwritten. When `true`, an existing regular file is removed before the new file is written directly to its final path. A failed extraction can leave the destination missing.
-- `onExtract`: Called after each regular file has been completely written and closed; it does not wait for the rest of the batch. Concurrent extraction can make event order differ from selection order. Receives `{entry, outputPath, percent}`, where `percent` is the completed-file count divided by the total selected regular files. `entry` retains the original archive metadata and `outputPath` is the final destination path.
-- `maxBytes`: Maximum total uncompressed output size. Defaults to 4 GiB; set to `null` to disable the limit.
-- `signal`: Optional `AbortSignal`. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
+- `ids`: Entry IDs to extract. Default: all entries are selected when both `ids` and `paths` are omitted.
+- `paths`: Exact, original archive paths to extract, using `/` separators. Cannot be combined with `ids`.
+- `concurrency`: Maximum number of native extraction batches this call runs simultaneously. Default: `1`; accepts integers from `1` to `128` and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`. For 7z archives, values above `1` are generally not recommended because the format may use multiple threads internally.
+- `overwrite`: Default: `false`, so existing files are not overwritten. When `true`, an existing regular file is removed before the new file is written directly to its final path. A failed extraction can leave the destination missing.
+- `onExtract`: Optional; no callback is invoked by default. Called after each regular file has been completely written and closed; it does not wait for the rest of the batch. Concurrent extraction can make event order differ from selection order. Receives `{entry, outputPath, percent}`, where `percent` is the completed-file count divided by the total selected regular files. `entry` retains the original archive metadata and `outputPath` is the final destination path.
+- `maxBytes`: Maximum total uncompressed output size. Default: `4 GiB`; set to `null` to disable the limit.
+- `signal`: Optional `AbortSignal`; omitted by default. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
 
 Each native extraction call receives a batch of entry IDs and output paths. The addon queues disk writes asynchronously while 7-Zip continues extracting later entries; `onExtract` runs after that file's queued writes have completed and the file is closed. File contents are not streamed through Node.js or Electron. The `extractToFolder()` promise resolves after all `onExtract` callbacks have run.
 
 On Windows only, unsupported filename characters (including control characters), trailing dots/spaces in each destination component, and reserved device names are normalized for the output path; selectors and entry metadata remain unchanged. On Linux and macOS, platform-supported filename characters are preserved. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 
-### Extracting to memory
+### `archive.extract()`
 
 ```ts
 const image = await archive.extract(entry.id); // Buffer
@@ -137,7 +167,7 @@ const pages = await archive.extract([page1.id, page2.path]); // Buffer[]
 
 Paths use `/` separators. Batch results are returned in the same order as the requested selectors; duplicate entries are rejected. A missing path rejects with `ERR_INVALID_ENTRY`. A buffered extraction is limited to 256 MiB per entry, with a 512 MiB cap on native results pending transfer to JavaScript. For large entries, use a stream or extract to a folder instead.
 
-### Reading a byte range
+### `archive.read()`
 
 ```ts
 const header = await archive.read(entry.path, {
@@ -158,12 +188,12 @@ const prefixes = await archive.read([
 
 `read()` accepts these options:
 
-- `offset`: Byte position at which to start reading. Defaults to `0`; accepts a non-negative safe integer or `bigint`.
-- `length`: Number of bytes to return. Required; accepts a non-negative safe integer or `bigint`. A range read is limited to 64 MiB.
+- `offset`: Byte position at which to start reading. Default: `0`; accepts a non-negative safe integer or `bigint`.
+- `length`: Number of bytes to return. Required; has no default. Accepts a non-negative safe integer or `bigint`. A range read is limited to 64 MiB.
 
 A range read returns only the requested bytes. A batch is limited to 64 MiB per entry and 256 MiB total output. It uses the handler's normal extraction path, however, so a sequential or solid format may still need to decompress preceding data or the whole entry. It is not guaranteed to be constant-time random access.
 
-### Streams and output destinations
+### `archive.createReadStream()`
 
 Create a standard Node.js `Readable` for a large entry:
 
@@ -179,13 +209,15 @@ for await (const chunk of archive.createReadStream(entry.path, {
 
 `createReadStream()` accepts these options:
 
-- `highWaterMark`: Readable buffer threshold in bytes. Must be an integer from 1 byte to 16 MiB; defaults to Node.js's Readable default.
-- `maxBytes`: Maximum number of output bytes. Defaults to 4 GiB; accepts a non-negative `number` or `bigint`, or `null` to disable the limit.
-- `signal`: Optional `AbortSignal` that cancels extraction.
+- `highWaterMark`: Readable buffer threshold in bytes. Default: Node.js's `Readable` default; accepts integers from 1 byte to 16 MiB.
+- `maxBytes`: Maximum number of output bytes. Default: `4 GiB`; accepts a non-negative `number` or `bigint`, or `null` to disable the limit.
+- `signal`: Optional `AbortSignal` that cancels extraction; omitted by default.
 
 The native engine emits bounded 64 KiB chunks and waits for stream demand, preserving backpressure. Destroying the stream or aborting its signal cancels extraction at the next output boundary.
 
-To pipe directly to a Node.js `Writable`:
+### `archive.extractToStream()`
+
+Pipe directly to a Node.js `Writable`:
 
 ```ts
 import {createWriteStream} from 'node:fs';
@@ -197,16 +229,13 @@ await archive.extractToStream(entry.path, createWriteStream('./page.jpg'), {
 
 `extractToStream()` accepts the same `highWaterMark`, `maxBytes`, and `signal` options as `createReadStream()`. It respects backpressure and ends the destination when extraction succeeds. A destination error, early close, or abort rejects the Promise.
 
-### Creating ZIP, 7z, TAR, and WIM archives
+### `Archive.create()`
 
 ```ts
 await Archive.create('./archive.zip', [
 	{sourcePath: './image.jpg', path: 'image.jpg'},
 	{sourcePath: './file.txt', path: 'file.txt'},
-], {
-	compressionLevel: 5,
-	overwrite: false,
-});
+]);
 ```
 
 `Archive.create()` accepts regular source files and their desired archive-internal paths:
@@ -218,13 +247,13 @@ The source file's modification time is stored in the archive.
 
 It also accepts these options:
 
-- `format`: Archive format. If omitted, inferred as ZIP from `.zip`, 7z from `.7z`, TAR from `.tar`, or WIM from `.wim`. Set to `'zip'`, `'7z'`, `'tar'`, or `'wim'` to use another output extension.
-- `compressionLevel`: Integer from 0 to 9; defaults to 5 and applies only to ZIP and 7z. TAR is uncompressed; WIM uses the upstream handler's default settings.
-- `overwrite`: Defaults to `false`. When `true`, an existing output file is replaced after the new archive has been written.
+- `format`: Archive format. Default: inferred as ZIP from `.zip`, 7z from `.7z`, TAR from `.tar`, or WIM from `.wim`. Set to `'zip'`, `'7z'`, `'tar'`, or `'wim'` to use another output extension.
+- `compressionLevel`: Default: `5`; accepts integers from `0` to `9` and applies only to ZIP and 7z. TAR is uncompressed; WIM uses the upstream handler's default settings.
+- `overwrite`: Default: `false`. When `true`, an existing output file is replaced after the new archive has been written.
 
 Duplicate, absolute, or traversal paths are rejected, but platform-supported filename characters such as trailing spaces are preserved in the archive-internal path. The output is first written to a temporary file beside the destination, then installed atomically, so an existing file is preserved if archive creation fails. Archive creation runs in the bounded native worker pool and does not launch a 7-Zip executable.
 
-### Concurrency
+### `Archive.concurrency()`
 
 ```ts
 const current = Archive.concurrency();
@@ -240,7 +269,7 @@ The default is the lesser of 4 and the parallelism available to Node.js.
 
 Concurrent operations on one archive use independent decoder contexts rather than calling one 7-Zip archive object simultaneously. This is safe for handlers that support independent contexts, but it does not guarantee a speedup. Solid archives may decompress shared data more than once; batching related entries may be faster.
 
-### Closing an archive
+### `archive.close()`
 
 Call `close()` when finished. It rejects future API calls; operations already submitted keep the native state alive until they finish.
 
@@ -282,7 +311,7 @@ See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) for third-party redistrib
 
 ## Platform support
 
-The package includes prebuilt binaries for:
+Published npm releases include prebuilt binaries for:
 
 | Platform | Architectures |
 | --- | --- |
@@ -290,7 +319,7 @@ The package includes prebuilt binaries for:
 | macOS | x64, ARM64 |
 | Windows | x64, ARM64 |
 
-Windows x86 (ia32) is not supported by the published prebuilt binaries.
+The release workflow runs the test suite on Linux x64 and ARM64, macOS x64 and ARM64, and Windows x64 and ARM64. Linux x86 (ia32) and ARM32 builds are cross-compiled and binary-checked, but are not runtime-tested by that workflow. Windows x86 (ia32) prebuilds are not published.
 
 ## Electron
 
@@ -336,6 +365,8 @@ git add .gitmodules vendor/7zip
 Review the upstream changes and commit the new submodule revision. The current submodule is pinned to 7-Zip 26.05 (`b88c6bc09339de32f7d18bbab900686b244f42ba`).
 
 ## Benchmarks
+
+The benchmark scripts that use `--experimental-strip-types` require Node.js 22.6.0 or newer; this is separate from the package's Node.js runtime requirement.
 
 Run the native benchmark against a representative archive:
 
