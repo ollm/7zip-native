@@ -90,6 +90,7 @@ Each entry includes:
 | --- | --- | --- |
 | `id` | `number` | Stable ID within this opened archive |
 | `path` | `string` | Entry path, using `/` separators |
+| `extractedPath` | `string` | Relative output path after platform-specific filename normalization; Windows-invalid characters are replaced |
 | `size` | `bigint` | Uncompressed size |
 | `compressedSize` | `bigint` | Compressed size |
 | `isDirectory` | `boolean` | Whether the entry is a directory |

@@ -124,7 +124,7 @@ interface NativeBinding {
 	): Promise<void>;
 }
 
-type NativeEntry = ArchiveEntry;
+type NativeEntry = Omit<ArchiveEntry, 'extractedPath'>;
 
 interface NativeCreateEntry extends ArchiveCreateEntry {
 	readonly mtimeMs: number;
@@ -218,6 +218,13 @@ function sanitizeOutputPath(entryPath: string): string
 		return entryPath;
 	}
 	return entryPath.replace(/\\/g, '/').split('/').map(sanitizeWindowsSegment).join('/');
+}
+
+function getExtractedPath(entryPath: string): string
+{
+	const normalized = sanitizeOutputPath(entryPath).replace(/\\/g, '/');
+	const segments = normalized.split('/').filter(segment => segment !== '' && segment !== '.');
+	return segments.join(sep);
 }
 
 function assertSafeRelativeArchivePath(entryPath: string): void
@@ -758,9 +765,14 @@ export class Archive {
 
 	async entries(): Promise<readonly ArchiveEntry[]> {
 		this.assertOpen();
-		this.entriesPromise ??= native.entries(this.handle).catch((cause) => {
-			throw new ArchiveError('ERR_ARCHIVE_OPEN', errorMessage(cause), {cause});
-		});
+		this.entriesPromise ??= native.entries(this.handle)
+			.then(entries => entries.map(entry => ({
+				...entry,
+				extractedPath: getExtractedPath(entry.path),
+			})))
+			.catch((cause) => {
+				throw new ArchiveError('ERR_ARCHIVE_OPEN', errorMessage(cause), {cause});
+			});
 		return this.entriesPromise;
 	}
 

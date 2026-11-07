@@ -4,6 +4,7 @@ export type EntrySelector = EntryId | string;
 export interface ArchiveEntry {
 	readonly id: EntryId;
 	readonly path: string;
+	readonly extractedPath: string;
 	readonly size: bigint;
 	readonly compressedSize: bigint;
 	readonly isDirectory: boolean;

@@ -591,6 +591,13 @@ test('sanitizes Windows output paths without changing path selectors or entry me
 	const [entry, reservedEntry] = await archive.entries();
 	assert.ok(entry);
 	assert.ok(reservedEntry);
+	assert.equal(
+		entry.extractedPath,
+		process.platform === 'win32'
+			? join('folder__', 'bad_name__')
+			: join('folder. ', 'bad<>\t:|?*". '),
+	);
+	assert.equal(reservedEntry.extractedPath, process.platform === 'win32' ? '_CON.txt' : 'CON.txt');
 	const byPathDestination = join(directory, 'windows-output-by-path');
 	const byIdDestination = join(directory, 'windows-output-by-id');
 	const reservedDestination = join(directory, 'windows-output-reserved');
