@@ -622,7 +622,9 @@ test('sanitizes Windows output paths without changing path selectors or entry me
 	}
 });
 
-test('preserves platform-supported output path characters outside Windows', async () => {
+test('preserves platform-supported output path characters outside Windows', {
+	skip: process.platform === 'win32',
+}, async () => {
 	const archivePath = join(directory, 'platform-supported-output-paths.zip');
 	const internalPath = 'folder. /bad:name. ';
 	await writeFile(archivePath, makeStoredZip([{name: internalPath, data: 'preserved'}]));
