@@ -98,6 +98,35 @@ Each entry includes:
 | `attributes` | `number` | Format-specific attributes |
 | `crc` | `number \| undefined` | CRC when supplied by the format |
 
+### Extracting to a folder
+
+```ts
+await archive.extractToFolder('./unpacked', {
+	paths: ['chapter/page1.jpg', 'chapter/page2.jpg'], // alternatively, use ids
+	concurrency: 2,
+	overwrite: true,
+	onExtract: ({entry, outputPath, percent}) => {
+		console.log(`Extracted ${entry.path} to ${outputPath} (${percent}%)`);
+	},
+	maxBytes: 2n * 1024n * 1024n * 1024n,
+	signal: abortController.signal,
+});
+```
+
+`extractToFolder()` accepts these options:
+
+- `ids`: Entry IDs to extract. Omit both `ids` and `paths` to extract every entry.
+- `paths`: Exact, original archive paths to extract, using `/` separators. This cannot be combined with `ids`.
+- `concurrency`: Maximum number of native extraction batches this call runs simultaneously. Must be an integer from 1 to 128; defaults to 1 and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`.
+- `overwrite`: Defaults to `false`, so existing files are not overwritten. When `true`, an existing regular file is removed before the new file is written directly to its final path. A failed extraction can leave the destination missing.
+- `onExtract`: Called after each regular file has been completely written and closed; it does not wait for the rest of the batch. Concurrent extraction can make event order differ from selection order. Receives `{entry, outputPath, percent}`, where `percent` is the completed-file count divided by the total selected regular files. `entry` retains the original archive metadata and `outputPath` is the final destination path.
+- `maxBytes`: Maximum total uncompressed output size. Defaults to 4 GiB; set to `null` to disable the limit.
+- `signal`: Optional `AbortSignal`. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
+
+Each native extraction call receives a batch of entry IDs and output paths. The addon queues disk writes asynchronously while 7-Zip continues extracting later entries; `onExtract` runs after that file's queued writes have completed and the file is closed. File contents are not streamed through Node.js or Electron. The `extractToFolder()` promise resolves after all `onExtract` callbacks have run.
+
+On Windows only, unsupported filename characters (including control characters), trailing dots/spaces in each destination component, and reserved device names are normalized for the output path; selectors and entry metadata remain unchanged. On Linux and macOS, platform-supported filename characters are preserved. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
+
 ### Extracting to memory
 
 ```ts
@@ -194,35 +223,6 @@ It also accepts these options:
 - `overwrite`: Defaults to `false`. When `true`, an existing output file is replaced after the new archive has been written.
 
 Duplicate, absolute, or traversal paths are rejected, but platform-supported filename characters such as trailing spaces are preserved in the archive-internal path. The output is first written to a temporary file beside the destination, then installed atomically, so an existing file is preserved if archive creation fails. Archive creation runs in the bounded native worker pool and does not launch a 7-Zip executable.
-
-### Extracting to a folder
-
-```ts
-await archive.extractToFolder('./unpacked', {
-	paths: ['chapter/page1.jpg', 'chapter/page2.jpg'], // alternatively, use ids
-	concurrency: 2,
-	overwrite: true,
-	onExtract: ({entry, outputPath, percent}) => {
-		console.log(`Extracted ${entry.path} to ${outputPath} (${percent}%)`);
-	},
-	maxBytes: 2n * 1024n * 1024n * 1024n,
-	signal: abortController.signal,
-});
-```
-
-`extractToFolder()` accepts these options:
-
-- `ids`: Entry IDs to extract. Omit both `ids` and `paths` to extract every entry.
-- `paths`: Exact, original archive paths to extract, using `/` separators. This cannot be combined with `ids`.
-- `concurrency`: Maximum number of native extraction batches this call runs simultaneously. Must be an integer from 1 to 128; defaults to 1 and is capped at the process-wide native worker-pool concurrency. This does not change `Archive.concurrency()`.
-- `overwrite`: Defaults to `false`, so existing files are not overwritten. When `true`, an existing regular file is removed before the new file is written directly to its final path. A failed extraction can leave the destination missing.
-- `onExtract`: Called after each regular file has been completely written and closed; it does not wait for the rest of the batch. Concurrent extraction can make event order differ from selection order. Receives `{entry, outputPath, percent}`, where `percent` is the completed-file count divided by the total selected regular files. `entry` retains the original archive metadata and `outputPath` is the final destination path.
-- `maxBytes`: Maximum total uncompressed output size. Defaults to 4 GiB; set to `null` to disable the limit.
-- `signal`: Optional `AbortSignal`. Cancellation stops new files from starting, cancels or waits for active extractions, cleans temporary replacement files, and rejects the call.
-
-Each native extraction call receives a batch of entry IDs and output paths. The addon queues disk writes asynchronously while 7-Zip continues extracting later entries; `onExtract` runs after that file's queued writes have completed and the file is closed. File contents are not streamed through Node.js or Electron. The `extractToFolder()` promise resolves after all `onExtract` callbacks have run.
-
-On Windows only, unsupported filename characters (including control characters), trailing dots/spaces in each destination component, and reserved device names are normalized for the output path; selectors and entry metadata remain unchanged. On Linux and macOS, platform-supported filename characters are preserved. Unsafe archive paths, path collisions, symlinked destination components, and symlink or non-file targets are rejected. Archive links are written as regular file data; the API does not create symbolic or hard links. If extraction fails partway through, files already written (or partially written) may remain in the destination.
 
 ### Concurrency
 
