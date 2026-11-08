@@ -2,7 +2,7 @@
 
 ## 7-Zip
 
-This package bundles a shared-library build of 7-Zip 26.05 from the official
+This package bundles a shared-library build of 7-Zip 26.06 from the official
 `ip7z/7zip` repository, preserved as a git submodule at `vendor/7zip`.
 Copyright (C) 1999-2026 Igor Pavlov.
 

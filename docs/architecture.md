@@ -3,7 +3,7 @@
 ## Integration boundary
 
 The project pins the official `ip7z/7zip` repository as a git submodule at
-`vendor/7zip`; the pinned revision is 7-Zip 26.05. Upstream exposes its archive
+`vendor/7zip`; the pinned revision is 7-Zip 26.06. Upstream exposes its archive
 handlers through the COM-style `IInArchive` interface and `CreateArchiver`
 registration exports, not a stable general-purpose C++ library API.
 

@@ -3,7 +3,7 @@
 
 # 7zip-native
 
-### Current version `26.05`
+### Current version `26.06`
 Upstream 7-Zip archive engine from https://github.com/ip7z/7zip/
 
 Native Node-API bindings for the 7-Zip archive engine. Use a typed, Promise-based Node.js API to inspect archives, read entry data, stream large files, or extract entries without launching `7z`, `7zz`, or another archive executable.
@@ -362,7 +362,7 @@ git -C vendor/7zip rev-parse HEAD
 git add .gitmodules vendor/7zip
 ```
 
-Review the upstream changes and commit the new submodule revision. The current submodule is pinned to 7-Zip 26.05 (`b88c6bc09339de32f7d18bbab900686b244f42ba`).
+Review the upstream changes and commit the new submodule revision. The current submodule is pinned to 7-Zip 26.06 (`d3296e39e1f1f92c7b41c0c3848e65640428d42d`).
 
 ## Benchmarks
 
