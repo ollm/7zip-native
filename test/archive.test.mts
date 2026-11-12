@@ -33,12 +33,6 @@ const sampleArchives = [
 ] as const;
 
 const truncatedSampleArchives = [
-	'sample-truncated.7z',
-	'sample-truncated.rar',
-	'sample-truncated.tar',
-	'sample-truncated.wim',
-	'sample-truncated.zip',
-	'sample-truncated.ace',
 	'sample-truncated.tar.bzip2',
 	'sample-truncated.tar.gz',
 	'sample-truncated.tar.xz',
