@@ -18,12 +18,33 @@ const sevenZip = createRequire(import.meta.url)('7zip-bin-full') as {path7zc: st
 const testPassword = 'correct-horse';
 const sampleDirectory = fileURLToPath(new URL('../samples/', import.meta.url));
 const sourcePackageDirectory = fileURLToPath(new URL('../', import.meta.url));
-const sampleArchives = ['sample.7z', 'sample.rar', 'sample.tar', 'sample.wim', 'sample.zip'] as const;
+
+const sampleArchives = [
+	'sample.7z',
+	'sample.rar',
+	'sample.tar',
+	'sample.wim',
+	'sample.zip',
+	'sample.ace',
+	'sample.tar.bzip2',
+	'sample.tar.gz',
+	'sample.tar.xz',
+	'sample.tar.zstd',
+] as const;
+
 const truncatedSampleArchives = [
+	'sample-truncated.7z',
 	'sample-truncated.rar',
 	'sample-truncated.tar',
+	'sample-truncated.wim',
 	'sample-truncated.zip',
+	'sample-truncated.ace',
+	'sample-truncated.tar.bzip2',
+	'sample-truncated.tar.gz',
+	'sample-truncated.tar.xz',
+	'sample-truncated.tar.zstd',
 ] as const;
+
 const sampleAssetPaths = [
 	'sample/noise.avif',
 	'sample/noise.jpg',
