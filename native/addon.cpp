@@ -52,6 +52,7 @@ constexpr std::uint64_t kMaxPendingOperations = 128;
 constexpr std::uint32_t kMaxExtractionConcurrency = 128;
 constexpr std::uint64_t kMaxEntries = 1'000'000;
 constexpr std::uint64_t kMaxSingleOutputBytes = 256ULL * 1024 * 1024;
+constexpr std::uint64_t kMaxNestedTarBytes = 1024ULL * 1024 * 1024;
 constexpr std::uint64_t kMaxConcurrentOutputBytes = 512ULL * 1024 * 1024;
 constexpr std::uint64_t kMaxReadBytes = 64ULL * 1024 * 1024;
 constexpr std::size_t kMaxPasswordBytes = 1024 * 1024;
@@ -569,6 +570,50 @@ std::string Extension(const std::string& path)
 	return LowerAscii(path.substr(dot + 1));
 }
 
+bool IsCompressedTarPath(const std::string& path)
+{
+	const auto lowerPath = LowerAscii(path);
+	for (const std::string suffix : {
+		".tar.gz", ".tar.bz2", ".tar.bzip2", ".tar.xz", ".tar.zst", ".tar.zstd"
+	}) {
+		if (lowerPath.size() >= suffix.size()
+			&& lowerPath.compare(lowerPath.size() - suffix.size(), suffix.size(), suffix) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool HasTarHeader(const std::vector<std::uint8_t>& data)
+{
+	if (data.size() < 512) {
+		return false;
+	}
+	std::size_t start = 148;
+	std::size_t end = 156;
+	while (start < end && (data[start] == 0 || data[start] == ' ')) {
+		++start;
+	}
+	while (end > start && (data[end - 1] == 0 || data[end - 1] == ' ')) {
+		--end;
+	}
+	if (start == end) {
+		return false;
+	}
+	std::uint64_t expected = 0;
+	for (std::size_t index = start; index < end; ++index) {
+		if (data[index] < '0' || data[index] > '7') {
+			return false;
+		}
+		expected = expected * 8 + (data[index] - '0');
+	}
+	std::uint64_t actual = 0;
+	for (std::size_t index = 0; index < 512; ++index) {
+		actual += index >= 148 && index < 156 ? ' ' : data[index];
+	}
+	return expected == actual;
+}
+
 std::vector<std::string> SplitExtensions(const std::wstring& value)
 {
 	std::wstring normalized = value;
@@ -731,6 +776,7 @@ struct OutputRequest {
 	std::uint64_t offset = 0;
 	std::uint64_t length = 0;
 	std::uint64_t entrySize = 0;
+	std::uint64_t maxOutputBytes = kMaxSingleOutputBytes;
 	bool encrypted = false;
 	bool abortOnLimit = false;
 	bool limitReached = false;
@@ -848,6 +894,77 @@ Z7_COM7F_IMF(FileInStream::Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosi
 	if (!file_.good()) {
 		return E_FAIL;
 	}
+	if (newPosition != nullptr) {
+		*newPosition = target;
+	}
+	return S_OK;
+}
+
+class MemoryInStream final : public IInStream, public CMyUnknownImp {
+	Z7_COM_QI_BEGIN2(IInStream)
+	Z7_COM_QI_ENTRY(ISequentialInStream)
+	Z7_COM_QI_END
+	Z7_COM_ADDREF_RELEASE
+
+	Z7_IFACE_COM7_IMP(ISequentialInStream)
+	Z7_IFACE_COM7_IMP(IInStream)
+
+public:
+	explicit MemoryInStream(const std::vector<std::uint8_t>& data): data_(data) {}
+
+private:
+	const std::vector<std::uint8_t>& data_;
+	std::mutex mutex_;
+	std::uint64_t position_ = 0;
+};
+
+Z7_COM7F_IMF(MemoryInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const auto available = position_ < data_.size() ? data_.size() - position_ : 0;
+	const auto count = static_cast<UInt32>(std::min<std::uint64_t>(
+		size, available));
+	if (count != 0) {
+		std::memcpy(data, data_.data() + position_, count);
+		position_ += count;
+	}
+	if (processedSize != nullptr) {
+		*processedSize = count;
+	}
+	return S_OK;
+}
+
+Z7_COM7F_IMF(MemoryInStream::Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition))
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	std::uint64_t base = 0;
+	switch (seekOrigin) {
+		case 0:
+			break;
+		case 1:
+			base = position_;
+			break;
+		case 2:
+			base = data_.size();
+			break;
+		default:
+			return E_INVALIDARG;
+	}
+	std::uint64_t target = 0;
+	if (offset >= 0) {
+		const auto advance = static_cast<std::uint64_t>(offset);
+		if (advance > static_cast<std::uint64_t>(INT64_MAX) - base) {
+			return E_INVALIDARG;
+		}
+		target = base + advance;
+	} else {
+		const auto retreat = static_cast<std::uint64_t>(-(offset + 1)) + 1;
+		if (retreat > base) {
+			return E_INVALIDARG;
+		}
+		target = base - retreat;
+	}
+	position_ = target;
 	if (newPosition != nullptr) {
 		*newPosition = target;
 	}
@@ -1256,7 +1373,8 @@ Z7_COM7F_IMF(VectorOutStream::Write(const void *data, UInt32 size, UInt32 *proce
 	const auto copyEnd = std::min(end, wantedEnd);
 	if (copyEnd > copyStart) {
 		const auto count = copyEnd - copyStart;
-		if (count > kMaxSingleOutputBytes - request_->data.size()) {
+		if (request_->data.size() > request_->maxOutputBytes
+			|| count > request_->maxOutputBytes - request_->data.size()) {
 			return E_OUTOFMEMORY;
 		}
 		const auto *bytes = static_cast<const std::uint8_t *>(data);
@@ -2166,10 +2284,15 @@ public:
 		std::vector<Format> formats;
 		formats.reserve(formatCount);
 		std::vector<Byte> header(1 << 20);
-		auto *probeFile = new FileInStream();
-		CMyComPtr<IInStream> probe = probeFile;
-		if (!probeFile->Open(path)) {
-			throw std::runtime_error("Unable to open archive path");
+		CMyComPtr<IInStream> probe;
+		if (memoryInput_) {
+			probe = new MemoryInStream(memoryData_);
+		} else {
+			auto *probeFile = new FileInStream();
+			probe = probeFile;
+			if (!probeFile->Open(path)) {
+				throw std::runtime_error("Unable to open archive path");
+			}
 		}
 		UInt32 headerSize = 0;
 		if (probe->Read(header.data(), static_cast<UInt32>(header.size()), &headerSize) != S_OK) {
@@ -2178,8 +2301,8 @@ public:
 		if (headerSize == 0) {
 			throw std::runtime_error("Archive file is empty");
 		}
-		const bool endOfFile = headerSize < header.size()
-			|| GetFileStamp(path).size <= headerSize;
+		const auto sourceSize = memoryInput_ ? memoryData_.size() : GetFileStamp(path).size;
+		const bool endOfFile = headerSize < header.size() || sourceSize <= headerSize;
 		for (UInt32 i = 0; i < formatCount; ++i) {
 			NWindows::NCOM::CPropVariant classIdValue;
 			if (g_getHandlerProperty(i, NArchive::NHandlerPropID::kClassID, &classIdValue) != S_OK
@@ -2307,10 +2430,15 @@ public:
 		for (const auto& format : formats) {
 			lastFormatIndex = format.index;
 			lastFormatName = format.name;
-			auto *inputFile = new FileInStream();
-			CMyComPtr<IInStream> input = inputFile;
-			if (!inputFile->Open(path)) {
-				throw std::runtime_error("Unable to open archive path");
+			CMyComPtr<IInStream> input;
+			if (memoryInput_) {
+				input = new MemoryInStream(memoryData_);
+			} else {
+				auto *inputFile = new FileInStream();
+				input = inputFile;
+				if (!inputFile->Open(path)) {
+					throw std::runtime_error("Unable to open archive path");
+				}
 			}
 			void *created = nullptr;
 			const auto createResult = g_createObject(&format.classId, &IID_IInArchive, &created);
@@ -2339,7 +2467,12 @@ public:
 			archiveClassId_ = format.classId;
 			contexts_.push_back(std::move(context));
 			LoadEntries(contexts_.front()->archive);
-			fileStamp_ = GetFileStamp(path_);
+			if (!memoryInput_) {
+				fileStamp_ = GetFileStamp(path_);
+				if (IsCompressedTarPath(path_)) {
+					OpenNestedTar(enginePath);
+				}
+			}
 			return;
 		}
 		if (passwordRequested) {
@@ -2700,6 +2833,70 @@ public:
 	}
 
 private:
+	std::vector<std::uint8_t> DecodeEntryForNestedTar(std::uint32_t id)
+	{
+		OutputRequest request;
+		request.id = id;
+		request.length = kMaxNestedTarBytes;
+		request.entrySize = kMaxNestedTarBytes;
+		request.maxOutputBytes = kMaxNestedTarBytes;
+		request.abortOnLimit = true;
+		std::vector<OutputRequest> requests;
+		requests.push_back(std::move(request));
+		std::unordered_map<std::uint32_t, std::size_t> requestById{{id, 0}};
+		auto *callbackObject = new ExtractCallback(requests, requestById, password_);
+		CMyComPtr<IArchiveExtractCallback> callback = callbackObject;
+		if (g_setDeflateInputBufferSize(deflateBufferSize_) != S_OK) {
+			throw std::runtime_error("Unable to configure the Deflate input buffer");
+		}
+		const UInt32 itemIndex = id;
+		const auto result = contexts_.front()->archive->Extract(&itemIndex, 1, 0, callback);
+		auto& output = requests.front();
+		if (callbackObject->PasswordRequested()) {
+			throw std::runtime_error("Archive password is missing or incorrect");
+		}
+		if (output.limitReached) {
+			throw std::length_error("Decoded archive exceeds the in-memory output limit");
+		}
+		if (result != S_OK && output.data.empty()) {
+			throw std::runtime_error("Unable to decode the compressed TAR stream");
+		}
+		if (output.operationResult != NArchive::NExtract::NOperationResult::kOK
+			&& output.data.empty()) {
+			throw std::runtime_error("Unable to decode the compressed TAR stream");
+		}
+		return std::move(output.data);
+	}
+
+	void OpenNestedTar(const std::string& enginePath)
+	{
+		std::uint32_t fileId = 0;
+		bool foundFile = false;
+		for (const auto& entry : entries_) {
+			if (entry.directory) {
+				continue;
+			}
+			if (foundFile || entry.encrypted) {
+				return;
+			}
+			fileId = entry.id;
+			foundFile = true;
+		}
+		if (!foundFile) {
+			return;
+		}
+		auto tarData = DecodeEntryForNestedTar(fileId);
+		if (!HasTarHeader(tarData)) {
+			return;
+		}
+		const auto decodedPath = path_ + ".decoded.tar";
+		contexts_.clear();
+		entries_.clear();
+		memoryData_ = std::move(tarData);
+		memoryInput_ = true;
+		Open(decodedPath, password_, enginePath, deflateBufferSize_);
+	}
+
 	bool HasValidEntryPaths(IInArchive *archive) const
 	{
 		UInt32 count = 0;
@@ -2761,15 +2958,22 @@ private:
 
 	std::unique_ptr<ArchiveContext> OpenAdditionalContext()
 	{
-		const auto beforeOpen = GetFileStamp(path_);
-		if (beforeOpen.size != fileStamp_.size
-			|| beforeOpen.modified != fileStamp_.modified) {
-			throw std::runtime_error("Archive file changed since opening; reopen it before extracting");
+		if (!memoryInput_) {
+			const auto beforeOpen = GetFileStamp(path_);
+			if (beforeOpen.size != fileStamp_.size
+				|| beforeOpen.modified != fileStamp_.modified) {
+				throw std::runtime_error("Archive file changed since opening; reopen it before extracting");
+			}
 		}
-		auto *inputFile = new FileInStream();
-		CMyComPtr<IInStream> input = inputFile;
-		if (!inputFile->Open(path_)) {
-			throw std::runtime_error("Unable to reopen archive path for concurrent extraction");
+		CMyComPtr<IInStream> input;
+		if (memoryInput_) {
+			input = new MemoryInStream(memoryData_);
+		} else {
+			auto *inputFile = new FileInStream();
+			input = inputFile;
+			if (!inputFile->Open(path_)) {
+				throw std::runtime_error("Unable to reopen archive path for concurrent extraction");
+			}
 		}
 		void *created = nullptr;
 		const auto createResult = g_createObject(&archiveClassId_, &IID_IInArchive, &created);
@@ -2790,10 +2994,12 @@ private:
 			}
 			throw std::runtime_error("Unable to open an independent 7-Zip decoder context");
 		}
-		const auto stamp = GetFileStamp(path_);
-		if (stamp.size != fileStamp_.size || stamp.modified != fileStamp_.modified) {
-			archive->Close();
-			throw std::runtime_error("Archive file changed during concurrent extraction setup");
+		if (!memoryInput_) {
+			const auto stamp = GetFileStamp(path_);
+			if (stamp.size != fileStamp_.size || stamp.modified != fileStamp_.modified) {
+				archive->Close();
+				throw std::runtime_error("Archive file changed during concurrent extraction setup");
+			}
 		}
 		auto context = std::make_unique<ArchiveContext>();
 		context->archive = archive;
@@ -2832,6 +3038,8 @@ private:
 	std::vector<std::unique_ptr<ArchiveContext>> contexts_;
 	std::size_t contextsCreating_ = 0;
 	std::string path_;
+	std::vector<std::uint8_t> memoryData_;
+	bool memoryInput_ = false;
 	GUID archiveClassId_{};
 	FileStamp fileStamp_{};
 	std::optional<std::string> password_;

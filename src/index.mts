@@ -625,8 +625,21 @@ export class Archive {
 		catch (cause)
 		{
 			const message = errorMessage(cause);
+			let code: 'ERR_ARCHIVE_PASSWORD' | 'ERR_RESOURCE_LIMIT' | 'ERR_ARCHIVE_OPEN';
+			if(isPasswordError(message))
+			{
+				code = 'ERR_ARCHIVE_PASSWORD';
+			}
+			else if(/in-memory output limit/.test(message))
+			{
+				code = 'ERR_RESOURCE_LIMIT';
+			}
+			else
+			{
+				code = 'ERR_ARCHIVE_OPEN';
+			}
 			throw new ArchiveError(
-				/password/i.test(message) ? 'ERR_ARCHIVE_PASSWORD' : 'ERR_ARCHIVE_OPEN',
+				code,
 				message,
 				{cause},
 			);
@@ -1330,10 +1343,15 @@ function errorMessage(error: unknown): string
 	return error instanceof Error ? error.message : String(error);
 }
 
+function isPasswordError(message: string): boolean
+{
+	return /\b(?:password (?:is )?(?:missing|incorrect)|(?:missing|incorrect) password)\b/i.test(message);
+}
+
 function extractionError(cause: unknown): ArchiveError
 {
 	const message = errorMessage(cause);
-	if(/password/i.test(message))
+	if(isPasswordError(message))
 	{
 		return new ArchiveError('ERR_ARCHIVE_PASSWORD', message, {cause});
 	}
@@ -1341,7 +1359,7 @@ function extractionError(cause: unknown): ArchiveError
 	{
 		return new ArchiveError('ERR_INVALID_ENTRY', message, {cause});
 	}
-	if(/in-memory output limit|queue is full/i.test(message))
+	if(/in-memory output limit|queue is full|stream output exceeds the \d+-byte limit/i.test(message))
 	{
 		return new ArchiveError('ERR_RESOURCE_LIMIT', message, {cause});
 	}

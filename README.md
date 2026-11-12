@@ -301,6 +301,7 @@ The package uses the handlers registered in the pinned upstream `Format7zF` bund
 
 ### Format-specific notes
 
+- **Compressed TARs:** `.tar.gz`, `.tar.bz2`/`.tar.bzip2`, `.tar.xz`, and `.tar.zst`/`.tar.zstd` are opened as their inner TAR archive. The decoded TAR is buffered up to 1024 MiB; larger streams reject with `ERR_RESOURCE_LIMIT`.
 - **RAR:** extraction uses upstream code subject to its LGPL terms and the unRAR restriction. This package does not create RAR archives or implement the proprietary RAR compression algorithm. Review the upstream notices before redistribution.
 - **Creation:** ZIP, 7z, TAR, and WIM archives can be created from filesystem files. Streams and directory trees are not accepted as sources.
 - **ACE:** not supported by this 7-Zip revision.
