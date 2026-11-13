@@ -341,6 +341,8 @@ When packaging with ASAR, ensure both `7zip_native.node` and the matching engine
 }
 ```
 
+When using a matching prebuild, the upstream source in `node_modules/7zip-native/vendor/7zip/` is not needed at runtime and can be excluded from the packaged application (for example, with the `electron-builder` file pattern `!node_modules/7zip-native/vendor/**`). Do not exclude `prebuilds/` or the matching addon and engine files. Keep the vendor source if your packaging workflow rebuilds the addon from source.
+
 If an application bundler relocates this package's JavaScript (for example, into a `www` directory), keep `7zip-native` resolvable as an installed dependency so the loader can locate the package's prebuilt binaries. Test the packaged application on each target; ASAR unpacking does not replace checking that the addon and engine can both be loaded from the packaged runtime.
 
 ## Build from source
